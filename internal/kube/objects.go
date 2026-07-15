@@ -74,7 +74,8 @@ type BackendRef struct {
 type Service struct {
 	Metadata ObjectMeta `yaml:"metadata"`
 	Spec     struct {
-		Ports []ServicePort `yaml:"ports"`
+		Selector map[string]string `yaml:"selector"`
+		Ports    []ServicePort     `yaml:"ports"`
 	} `yaml:"spec"`
 }
 
@@ -121,6 +122,7 @@ type Workload struct {
 }
 
 type ContainerPort struct {
+	Name          string `yaml:"name"`
 	ContainerPort int    `yaml:"containerPort"`
 	Protocol      string `yaml:"protocol"`
 }

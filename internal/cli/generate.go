@@ -44,10 +44,14 @@ func run(cmd *cobra.Command, write bool) error {
 	if err != nil {
 		return err
 	}
-	files, err := prof.Render(discovery.Build(objs))
+	committed := func(path string) ([]byte, error) {
+		return os.ReadFile(filepath.Join(flagRepo, path))
+	}
+	files, report, err := prof.Render(discovery.Build(objs), committed)
 	if err != nil {
 		return err
 	}
+	reportCoverage(report)
 
 	drift := false
 	for _, f := range files {
@@ -72,6 +76,30 @@ func run(cmd *cobra.Command, write bool) error {
 		return fmt.Errorf("policy drift detected")
 	}
 	return nil
+}
+
+// reportCoverage surfaces the honesty gate's finding: ingress backends PolySieve could not see
+// in the repo (Helm/operator-rendered). Their ports were preserved, not pruned — the run says
+// so plainly rather than silently emitting a smaller policy.
+func reportCoverage(r profile.Report) {
+	if len(r.BlindServices) == 0 && len(r.RouteBlindServices) == 0 {
+		return
+	}
+	if len(r.BlindServices) > 0 {
+		fmt.Fprintf(os.Stderr, "coverage: %d ingress backend(s) with no visible workload (Helm/operator pods);\n", len(r.BlindServices))
+		fmt.Fprintln(os.Stderr, "their Gatus healthcheck ports were preserved, not pruned:")
+		for _, s := range r.BlindServices {
+			fmt.Fprintln(os.Stderr, "  -", s)
+		}
+	}
+	if len(r.RouteBlindServices) > 0 {
+		fmt.Fprintf(os.Stderr, "coverage: %d ingress backend(s) whose routed port could not be resolved from the repo\n", len(r.RouteBlindServices))
+		fmt.Fprintln(os.Stderr, "(Service absent or named targetPort unresolved); their route policies were preserved, not pruned:")
+		for _, s := range r.RouteBlindServices {
+			fmt.Fprintln(os.Stderr, "  -", s)
+		}
+	}
+	fmt.Fprintln(os.Stderr, "resolve them with cluster/helm augmentation to enable pruning.")
 }
 
 func selectProfile(name string) (profile.Profile, error) {

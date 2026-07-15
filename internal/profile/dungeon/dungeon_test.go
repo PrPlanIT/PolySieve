@@ -6,11 +6,16 @@ import (
 
 	"github.com/PrPlanIT/PolySieve/internal/discovery"
 	"github.com/PrPlanIT/PolySieve/internal/kube"
+	"github.com/PrPlanIT/PolySieve/internal/profile"
 )
 
+// noCommitted is a CommittedReader with nothing on disk (the fully-derived path).
+func noCommitted(string) ([]byte, error) { return nil, nil }
+
 // fixture exercises: port resolution (foo:3000 → targetPort 8080), a numeric-passthrough
-// (ceph-dashboard:8443), gateway exclusion (neko-gateway), a Gatus-annotated service, and a
-// probe-labelled workload.
+// (ceph-dashboard:8443), gateway exclusion (neko-gateway), a Gatus-annotated service, a
+// statically probe-labelled workload, and an ingress-labelled workload (probe via the
+// mutate-probe-on-ingress Kyverno policy, reproduced from the repo).
 const fixture = `
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -98,15 +103,37 @@ spec:
         - ports:
             - containerPort: 7000
               protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ingressapp
+  namespace: hyrule-castle
+spec:
+  template:
+    metadata:
+      labels:
+        policy.prplanit.com/ingress: "true"
+    spec:
+      containers:
+        - ports:
+            - containerPort: 6000
+              protocol: TCP
 `
 
 func renderFixture(t *testing.T) map[string]string {
 	t.Helper()
+	m, _ := renderWith(t, fixture, noCommitted)
+	return m
+}
+
+func renderWith(t *testing.T, src string, committed profile.CommittedReader) (map[string]string, profile.Report) {
+	t.Helper()
 	var objs kube.Objects
-	if err := kube.Parse(&objs, []byte(fixture)); err != nil {
+	if err := kube.Parse(&objs, []byte(src)); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	files, err := New().Render(discovery.Build(&objs))
+	files, report, err := New().Render(discovery.Build(&objs), committed)
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -114,7 +141,7 @@ func renderFixture(t *testing.T) map[string]string {
 	for _, f := range files {
 		m[f.Path] = string(f.Content)
 	}
-	return m
+	return m, report
 }
 
 func TestCiliumContract(t *testing.T) {
@@ -131,8 +158,10 @@ func TestCiliumContract(t *testing.T) {
 
 func TestCiliumGatus(t *testing.T) {
 	m := renderFixture(t)
-	// annotated svc 9000 + probe workload 7000. Sorted: 7000, 9000.
+	// annotated svc 9000 + probe workload 7000 + ingress workload 6000 (probe-via-Kyverno).
+	// Sorted: 6000, 7000, 9000.
 	want := ciliumGatusSkeleton +
+		"            - port: \"6000\"\n              protocol: TCP\n" +
 		"            - port: \"7000\"\n              protocol: TCP\n" +
 		"            - port: \"9000\"\n              protocol: TCP\n"
 	got := m[ciliumBaseDir+"/ccnp-allow-gatus-healthcheck.yaml"]
@@ -191,5 +220,177 @@ func TestMultiPortSortAndFlow(t *testing.T) {
 	}
 	if got := istioPortList(discovery.SortDedupInts([]int{8080, 80, 3000})); got != "\"80\", \"3000\", \"8080\"" {
 		t.Errorf("sorted flow list wrong: %s", got)
+	}
+}
+
+// blindFixture: an ingress route to a Service with a selector that no repo workload satisfies —
+// i.e. a Helm/operator-rendered backend PolySieve cannot see the pods of.
+const blindFixture = `
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: gitlab
+  namespace: hyrule-castle
+spec:
+  parentRefs:
+    - name: xylem-gateway
+  rules:
+    - backendRefs:
+        - name: gitlab-webservice
+          port: 8181
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gitlab-webservice
+  namespace: hyrule-castle
+spec:
+  selector:
+    app: gitlab-webservice
+  ports:
+    - port: 8181
+      targetPort: 8181
+`
+
+const gatusPath = ciliumBaseDir + "/ccnp-allow-gatus-healthcheck.yaml"
+
+// committedGatus returns a CommittedReader serving the given rendered port entries as the
+// on-disk gatus file.
+func committedGatus(ports ...string) profile.CommittedReader {
+	var b strings.Builder
+	for _, p := range ports {
+		b.WriteString("            - port: \"" + p + "\"\n              protocol: TCP\n")
+	}
+	body := b.String()
+	return func(path string) ([]byte, error) {
+		if strings.HasSuffix(path, "ccnp-allow-gatus-healthcheck.yaml") {
+			return []byte(body), nil
+		}
+		return nil, nil
+	}
+}
+
+// A blind ingress backend is reported, its routed port is derived, and any committed-only port
+// (one PolySieve cannot see) is PRESERVED — never pruned.
+func TestBlindPreservesCommittedPorts(t *testing.T) {
+	m, report := renderWith(t, blindFixture, committedGatus("8181", "9168"))
+
+	if len(report.BlindServices) != 1 || report.BlindServices[0] != "hyrule-castle/gitlab-webservice" {
+		t.Fatalf("blind services = %v, want [hyrule-castle/gitlab-webservice]", report.BlindServices)
+	}
+	gatus := m[gatusPath]
+	if !strings.Contains(gatus, `- port: "8181"`) {
+		t.Errorf("routed port 8181 (derived) missing:\n%s", gatus)
+	}
+	if !strings.Contains(gatus, `- port: "9168"`) {
+		t.Errorf("committed-only port 9168 was pruned despite blind backend — the honesty gate failed:\n%s", gatus)
+	}
+}
+
+// With full coverage (no blind backends), a committed-only stale port must NOT survive — the
+// derived set is authoritative and pruning is safe.
+func TestFullCoveragePrunesStalePorts(t *testing.T) {
+	m, report := renderWith(t, fixture, committedGatus("55555"))
+
+	if len(report.BlindServices) != 0 {
+		t.Fatalf("expected no blind services, got %v", report.BlindServices)
+	}
+	if strings.Contains(m[gatusPath], "55555") {
+		t.Errorf("stale port 55555 preserved despite full coverage (should prune):\n%s", m[gatusPath])
+	}
+}
+
+// ServiceHasVisibleWorkload: a selector matched by a repo workload is visible; an unmatched
+// selector is blind; no selector is visible (external/manually-endpointed).
+func TestServiceVisibility(t *testing.T) {
+	src := `
+apiVersion: v1
+kind: Service
+metadata:
+  name: seen
+  namespace: lost-woods
+spec:
+  selector: { app: seen }
+  ports: [{ port: 80, targetPort: 80 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seen
+  namespace: lost-woods
+spec:
+  template:
+    metadata:
+      labels: { app: seen }
+    spec:
+      containers: [{ ports: [{ containerPort: 80 }] }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: unseen
+  namespace: lost-woods
+spec:
+  selector: { app: unseen }
+  ports: [{ port: 80, targetPort: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: external
+  namespace: lost-woods
+spec:
+  ports: [{ port: 80, targetPort: 80 }]
+`
+	var objs kube.Objects
+	if err := kube.Parse(&objs, []byte(src)); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	g := discovery.Build(&objs)
+	cases := map[string]bool{"seen": true, "unseen": false, "external": true}
+	for svc, want := range cases {
+		if got := g.ServiceHasVisibleWorkload("lost-woods", svc); got != want {
+			t.Errorf("ServiceHasVisibleWorkload(%s) = %v, want %v", svc, got, want)
+		}
+	}
+}
+
+// routeBlindFixture: an ingress route to a Service that isn't in the repo at all, so its port
+// can't be resolved — ResolvePort falls back to a guess.
+const routeBlindFixture = `
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: grafana
+  namespace: gossip-stone
+spec:
+  parentRefs:
+    - name: phloem-gateway
+  rules:
+    - backendRefs:
+        - name: grafana
+          port: 80
+`
+
+// A route-blind backend (unresolved port) is reported; its guessed port is NOT asserted, and the
+// committed route policy's real ports are preserved rather than pruned against the guess.
+func TestRouteBlindPreservesCommittedPorts(t *testing.T) {
+	committed := func(p string) ([]byte, error) {
+		if strings.HasSuffix(p, "gossip-stone/allow-gateway-ingress-phloem.yaml") {
+			return []byte("            ports: [\"3000\"]\n"), nil
+		}
+		return nil, nil
+	}
+	m, report := renderWith(t, routeBlindFixture, committed)
+
+	if len(report.RouteBlindServices) != 1 || report.RouteBlindServices[0] != "gossip-stone/grafana" {
+		t.Fatalf("route-blind services = %v, want [gossip-stone/grafana]", report.RouteBlindServices)
+	}
+	istio := m[istioOverlay+"/gossip-stone/allow-gateway-ingress-phloem.yaml"]
+	if !strings.Contains(istio, `"3000"`) {
+		t.Errorf("committed port 3000 pruned despite route-blind backend:\n%s", istio)
+	}
+	if strings.Contains(istio, `"80"`) {
+		t.Errorf("guessed fallback port 80 was asserted — should be excluded:\n%s", istio)
 	}
 }

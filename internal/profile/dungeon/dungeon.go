@@ -6,7 +6,9 @@ package dungeon
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/PrPlanIT/PolySieve/internal/discovery"
@@ -63,32 +65,84 @@ const (
 	ciliumBaseDir = "fluxcd/infrastructure/configs/base/cilium-policies"
 	istioOverlay  = "fluxcd/infrastructure/configs/overlays/production/istio-policies"
 	probeLabel    = "policy.prplanit.com/probe"
+	ingressLabel  = "policy.prplanit.com/ingress"
 	gatusEnabled  = "gatus.home-operations.com/enabled"
 	gatusEndpoint = "gatus.home-operations.com/endpoint"
 )
 
-func (d dungeon) Render(g *discovery.RouteGraph) ([]profile.File, error) {
-	var files []profile.File
+func (d dungeon) Render(g *discovery.RouteGraph, committed profile.CommittedReader) ([]profile.File, profile.Report, error) {
+	blind := blindIngressServices(g)
+	routeBlind := routeBlindServices(g)
 
-	files = append(files, d.ciliumContract(g), d.ciliumGatus(g))
-	files = append(files, d.istioGatewayIngress(g)...)
-	return files, nil
+	var files []profile.File
+	files = append(files, d.ciliumContract(g, committed), d.ciliumGatus(g, blind, committed))
+	files = append(files, d.istioGatewayIngress(g, committed)...)
+	return files, profile.Report{BlindServices: blind, RouteBlindServices: routeBlind}, nil
+}
+
+// blindIngressServices lists the ingress backends ("ns/service", sorted, unique) whose serving
+// workload is not visible in the repo — rendered by Helm or an operator. These are the backends
+// whose non-routed (container) ports the repo cannot describe, so the Gatus healthcheck
+// preserves rather than prunes while any remain unresolved.
+func blindIngressServices(g *discovery.RouteGraph) []string {
+	return uniqueBackendServices(g, func(b discovery.Backend) bool {
+		return !g.ServiceHasVisibleWorkload(b.BackendNS, b.Service)
+	})
+}
+
+// routeBlindServices lists the ingress backends whose routed port could not be resolved from the
+// repo (Service absent, or a named targetPort with no EndpointSlice) — the port is a fallback
+// guess. The route-derived policies covering these backends preserve rather than prune.
+func routeBlindServices(g *discovery.RouteGraph) []string {
+	return uniqueBackendServices(g, func(b discovery.Backend) bool { return !b.Resolved })
+}
+
+// uniqueBackendServices returns the sorted, unique "ns/service" of classified ingress backends
+// matching pred.
+func uniqueBackendServices(g *discovery.RouteGraph, pred func(discovery.Backend) bool) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, b := range g.Backends {
+		if classify(b.Gateway) == "" || !pred(b) {
+			continue
+		}
+		key := b.BackendNS + "/" + b.Service
+		if !seen[key] {
+			seen[key] = true
+			out = append(out, key)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ── Cilium: contract-ingress-backend ─────────────────────────────────────────
 // Every resolved backend port reachable through the three ingress gateways, cluster-wide.
 
-func (d dungeon) ciliumContract(g *discovery.RouteGraph) profile.File {
+func (d dungeon) ciliumContract(g *discovery.RouteGraph, committed profile.CommittedReader) profile.File {
+	path := ciliumBaseDir + "/ccnp-contract-ingress-backend.yaml"
 	var ports []int
+	blind := false
 	for _, b := range g.Backends {
 		if classify(b.Gateway) == "" {
 			continue
 		}
+		if !b.Resolved {
+			blind = true // route-blind: its real port is unknown, don't assert the guess
+			continue
+		}
 		ports = append(ports, b.Port)
+	}
+	// Honesty gate: a route-blind backend's real port is unknown, so preserve the committed
+	// contract rather than prune against a guess.
+	if blind {
+		if prev, err := committed(path); err == nil {
+			ports = append(ports, extractPorts(prev)...)
+		}
 	}
 	ports = discovery.SortDedupInts(ports)
 	return profile.File{
-		Path:    ciliumBaseDir + "/ccnp-contract-ingress-backend.yaml",
+		Path:    path,
 		Content: []byte(ciliumContractSkeleton + ciliumPortBlock(ports)),
 	}
 }
@@ -96,8 +150,11 @@ func (d dungeon) ciliumContract(g *discovery.RouteGraph) profile.File {
 // ── Cilium: allow-gatus-healthcheck ──────────────────────────────────────────
 // Ports Gatus probes: annotated-service targetPorts + probe-labelled workload containerPorts.
 
-func (d dungeon) ciliumGatus(g *discovery.RouteGraph) profile.File {
+func (d dungeon) ciliumGatus(g *discovery.RouteGraph, blind []string, committed profile.CommittedReader) profile.File {
+	path := ciliumBaseDir + "/ccnp-allow-gatus-healthcheck.yaml"
+
 	var ports []int
+	// (a) Ports of Gatus-annotated services, resolved to their pod targetPorts.
 	for _, s := range g.Objects.Services {
 		ann := s.Metadata.Annotations
 		_, hasEndpoint := ann[gatusEndpoint]
@@ -108,28 +165,94 @@ func (d dungeon) ciliumGatus(g *discovery.RouteGraph) profile.File {
 			ports = append(ports, g.ResolvePort(s.Metadata.Namespace, s.Metadata.Name, sp.Port))
 		}
 	}
+	// (b) Container ports of probe-labelled workloads. The label is rarely set by hand: the
+	// cluster's Kyverno ClusterPolicy `mutate-probe-on-ingress` stamps probe=true onto any
+	// Deployment/StatefulSet/DaemonSet whose pod template carries ingress=true, at admission.
+	// Reading the repo we never see that mutation, so reproduce it by unioning the
+	// ingress-labelled workloads with the few that carry probe=true statically.
 	ports = append(ports, g.WorkloadsWithPodLabel(probeLabel, "true")...)
-	ports = discovery.SortDedupInts(ports)
-	return profile.File{
-		Path:    ciliumBaseDir + "/ccnp-allow-gatus-healthcheck.yaml",
-		Content: []byte(ciliumGatusSkeleton + ciliumPortBlock(ports)),
+	ports = append(ports, g.WorkloadsWithPodLabel(ingressLabel, "true")...)
+	// (c) For ingress backends whose workload is invisible (Helm/operator), we can't read pod
+	// labels or container ports; contribute at least the resolved routed port, since a route
+	// backend behind an ingress gateway is probe-eligible. Non-routed ports are covered by the
+	// preserve gate below.
+	for _, b := range g.Backends {
+		if classify(b.Gateway) == "" || g.ServiceHasVisibleWorkload(b.BackendNS, b.Service) {
+			continue
+		}
+		if !b.Resolved {
+			continue // don't contribute a guessed port; the preserve gate keeps the committed one
+		}
+		ports = append(ports, b.Port)
 	}
+	// Honesty gate: while any ingress backend is blind we cannot know its non-routed ports, so
+	// we must not prune anything the committed policy already allows. Fold the committed ports
+	// in — additive only — and let the run report the blind set. When nothing is blind the
+	// derived set is authoritative and pruning is safe.
+	if len(blind) > 0 {
+		if prev, err := committed(path); err == nil {
+			ports = append(ports, extractPorts(prev)...)
+		}
+	}
+	ports = discovery.SortDedupInts(ports)
+	return profile.File{Path: path, Content: []byte(ciliumGatusSkeleton + ciliumPortBlock(ports))}
+}
+
+// Port extractors for the two rendered policy formats: the cilium block (`- port: "8200"`)
+// and the istio inline list (`ports: ["80", "3000"]`). They don't overlap — a cilium file has
+// no `ports: [` and an istio file has no `- port:` — so scanning for both is safe on either.
+var (
+	ciliumPortRe = regexp.MustCompile(`- port:\s*"?(\d+)"?`)
+	istioPortsRe = regexp.MustCompile(`ports:\s*\[([^\]]*)\]`)
+	numRe        = regexp.MustCompile(`\d+`)
+)
+
+// extractPorts pulls the numeric ports out of an already-rendered policy file, used by the
+// honesty gate to preserve a committed policy's existing ports under partial coverage.
+func extractPorts(b []byte) []int {
+	var out []int
+	for _, m := range ciliumPortRe.FindAllSubmatch(b, -1) {
+		if n, err := strconv.Atoi(string(m[1])); err == nil {
+			out = append(out, n)
+		}
+	}
+	for _, m := range istioPortsRe.FindAllSubmatch(b, -1) {
+		for _, num := range numRe.FindAll(m[1], -1) {
+			if n, err := strconv.Atoi(string(num)); err == nil {
+				out = append(out, n)
+			}
+		}
+	}
+	return out
 }
 
 // ── Istio: per-namespace gateway-ingress AuthorizationPolicies ───────────────
 // One file per (backend namespace, gateway class), allowing that gateway's SA to reach the
 // namespace's ingress-labelled pods on the resolved backend ports.
 
-func (d dungeon) istioGatewayIngress(g *discovery.RouteGraph) []profile.File {
+func (d dungeon) istioGatewayIngress(g *discovery.RouteGraph, committed profile.CommittedReader) []profile.File {
 	type key struct{ ns, class string }
-	groups := map[key][]int{}
+	type group struct {
+		ports []int
+		blind bool // some backend in this group has an unresolved (guessed) port
+	}
+	groups := map[key]*group{}
 	for _, b := range g.Backends {
 		c := classify(b.Gateway)
 		if c == "" {
 			continue
 		}
 		k := key{b.BackendNS, c}
-		groups[k] = append(groups[k], b.Port)
+		gr := groups[k]
+		if gr == nil {
+			gr = &group{}
+			groups[k] = gr
+		}
+		if !b.Resolved {
+			gr.blind = true
+			continue
+		}
+		gr.ports = append(gr.ports, b.Port)
 	}
 
 	// Deterministic file order: sort keys by "ns|class" (matches the reference's key sort).
@@ -143,13 +266,23 @@ func (d dungeon) istioGatewayIngress(g *discovery.RouteGraph) []profile.File {
 
 	var files []profile.File
 	for _, k := range keys {
+		gr := groups[k]
 		sa := gatewaySA[k.class]
+		path := fmt.Sprintf("%s/%s/allow-gateway-ingress-%s.yaml", istioOverlay, k.ns, k.class)
+		ports := gr.ports
+		// Honesty gate: if any backend for this namespace routed to a guessed port, preserve the
+		// committed policy's ports rather than prune against the guess.
+		if gr.blind {
+			if prev, err := committed(path); err == nil {
+				ports = append(ports, extractPorts(prev)...)
+			}
+		}
 		files = append(files, profile.File{
-			Path: fmt.Sprintf("%s/%s/allow-gateway-ingress-%s.yaml", istioOverlay, k.ns, k.class),
+			Path: path,
 			Content: []byte(fmt.Sprintf(istioTemplate,
-				k.class,                                  // metadata.name suffix
-				sa[0], sa[1],                             // principal ns / name
-				istioPortList(discovery.SortDedupInts(groups[k])), // inline flow list
+				k.class,      // metadata.name suffix
+				sa[0], sa[1], // principal ns / name
+				istioPortList(discovery.SortDedupInts(ports)), // inline flow list
 			)),
 		})
 	}
