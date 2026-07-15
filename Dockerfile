@@ -24,6 +24,13 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
         -X github.com/PrPlanIT/PolySieve/internal/cli.buildDate=${BUILD_DATE}" \
       -o /out/polysieve ./cmd/polysieve
 
+# kustomize — built from source through the module proxy (same toolchain, no GitHub-release
+# egress). Pinned to the version the dungeon host renders with, so output stays byte-exact.
+ARG KUSTOMIZE_VERSION=v5.8.0
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=0 go install sigs.k8s.io/kustomize/kustomize/v5@${KUSTOMIZE_VERSION}
+
 # ---- Runtime image ----
 FROM docker.io/library/alpine:3.24.1
 
@@ -33,12 +40,10 @@ LABEL org.opencontainers.image.title="PolySieve" \
       org.opencontainers.image.licenses="AGPL-3.0-only" \
       org.opencontainers.image.vendor="PrPlanIT"
 
-# kustomize — PolySieve renders the repo by shelling out to it.
-ARG KUSTOMIZE_VERSION=vkustomize/v5.8.1
-RUN apk add --no-cache ca-certificates && \
-    wget -qO- "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
-      | tar -xz -C /usr/local/bin kustomize
+RUN apk add --no-cache ca-certificates
 
 COPY --from=builder /out/polysieve /usr/local/bin/polysieve
+# kustomize — PolySieve renders the repo by shelling out to it (built in the Go stage).
+COPY --from=builder /go/bin/kustomize /usr/local/bin/kustomize
 
 ENTRYPOINT ["/usr/local/bin/polysieve"]
