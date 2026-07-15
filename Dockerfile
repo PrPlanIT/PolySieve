@@ -45,5 +45,8 @@ RUN apk add --no-cache ca-certificates
 COPY --from=builder /out/polysieve /usr/local/bin/polysieve
 # kustomize — PolySieve renders the repo by shelling out to it (built in the Go stage).
 COPY --from=builder /go/bin/kustomize /usr/local/bin/kustomize
+# kubectl — for best-effort `--cluster` augmentation. Sourced from the sanctioned alpine/k8s
+# image (musl-compatible, pulled through the registry mirror — no dl.k8s.io egress).
+COPY --from=docker.io/alpine/k8s:1.34.0 /usr/bin/kubectl /usr/local/bin/kubectl
 
 ENTRYPOINT ["/usr/local/bin/polysieve"]

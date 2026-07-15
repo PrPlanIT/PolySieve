@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/PrPlanIT/PolySieve/internal/cluster"
 	"github.com/PrPlanIT/PolySieve/internal/discovery"
 	"github.com/PrPlanIT/PolySieve/internal/profile"
 	"github.com/PrPlanIT/PolySieve/internal/profile/dungeon"
@@ -43,6 +44,16 @@ func run(cmd *cobra.Command, write bool) error {
 	objs, err := discovery.RenderRoots(cmd.Context(), flagKustomize, flagRepo, roots)
 	if err != nil {
 		return err
+	}
+	if flagCluster {
+		// Best-effort: append live-cluster objects so Helm/operator backends resolve. Repo
+		// objects were parsed first, so they stay authoritative; the cluster only fills gaps.
+		// Unreachable → warn and derive from the repo alone (the honesty gate then preserves).
+		if err := cluster.Augment(cmd.Context(), flagKubectl, objs); err != nil {
+			fmt.Fprintf(os.Stderr, "cluster augmentation unavailable (%v);\nderiving from the repo alone — blind backends will be preserved, not resolved\n", err)
+		} else {
+			fmt.Fprintln(os.Stderr, "cluster augmentation: applied (blind backends resolved from live-cluster state where present)")
+		}
 	}
 	committed := func(path string) ([]byte, error) {
 		return os.ReadFile(filepath.Join(flagRepo, path))

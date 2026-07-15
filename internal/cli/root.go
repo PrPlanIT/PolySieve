@@ -13,6 +13,8 @@ var (
 	flagProfile   string
 	flagKustomize string
 	flagRoots     []string
+	flagCluster   bool
+	flagKubectl   string
 	flagVerbose   bool
 )
 
@@ -31,6 +33,8 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&flagProfile, "profile", "dungeon", "cluster profile that shapes the emitted policy")
 	rootCmd.PersistentFlags().StringVar(&flagKustomize, "kustomize", "kustomize", "kustomize binary to render with")
 	rootCmd.PersistentFlags().StringSliceVar(&flagRoots, "root", nil, "override the profile's kustomize build roots (repeatable)")
+	rootCmd.PersistentFlags().BoolVar(&flagCluster, "cluster", false, "best-effort: resolve blind (Helm/operator) backends from the live cluster when reachable")
+	rootCmd.PersistentFlags().StringVar(&flagKubectl, "kubectl", "kubectl", "kubectl binary for --cluster augmentation")
 	rootCmd.PersistentFlags().BoolVarP(&flagVerbose, "verbose", "v", false, "verbose output")
 }
 

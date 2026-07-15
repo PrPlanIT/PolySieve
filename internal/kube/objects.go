@@ -143,9 +143,10 @@ type typeMeta struct {
 	Kind       string `yaml:"kind"`
 }
 
-// Parse decodes a multi-document manifest stream (as produced by `kustomize build`) into
-// the typed object set. Documents of kinds PolySieve does not care about are skipped.
-// Parse appends to dst so callers can accumulate across multiple rendered roots.
+// Parse decodes a multi-document manifest stream (as produced by `kustomize build`, or a
+// `kind: List` from `kubectl get -o yaml`) into the typed object set. Documents of kinds
+// PolySieve does not care about are skipped. Parse appends to dst so callers can accumulate
+// across multiple rendered roots and, optionally, live-cluster objects.
 func Parse(dst *Objects, stream []byte) error {
 	dec := yaml.NewDecoder(bytes.NewReader(stream))
 	for {
@@ -159,35 +160,55 @@ func Parse(dst *Objects, stream []byte) error {
 		if raw.Kind == 0 || (raw.Kind == yaml.DocumentNode && len(raw.Content) == 0) {
 			continue // empty document
 		}
-		var tm typeMeta
-		if err := raw.Decode(&tm); err != nil {
-			continue // not a k8s object we can classify; skip
-		}
-		switch tm.Kind {
-		case "HTTPRoute":
-			var o HTTPRoute
-			if err := raw.Decode(&o); err != nil {
-				return fmt.Errorf("decoding HTTPRoute: %w", err)
-			}
-			dst.HTTPRoutes = append(dst.HTTPRoutes, o)
-		case "Service":
-			var o Service
-			if err := raw.Decode(&o); err != nil {
-				return fmt.Errorf("decoding Service: %w", err)
-			}
-			dst.Services = append(dst.Services, o)
-		case "EndpointSlice":
-			var o EndpointSlice
-			if err := raw.Decode(&o); err != nil {
-				return fmt.Errorf("decoding EndpointSlice: %w", err)
-			}
-			dst.EndpointSlices = append(dst.EndpointSlices, o)
-		case "Deployment", "StatefulSet", "DaemonSet":
-			var o Workload
-			if err := raw.Decode(&o); err != nil {
-				return fmt.Errorf("decoding %s: %w", tm.Kind, err)
-			}
-			dst.Workloads = append(dst.Workloads, o)
+		if err := dispatch(dst, &raw); err != nil {
+			return err
 		}
 	}
+}
+
+// dispatch routes a single decoded node to its typed slice, recursing into `kind: List` items.
+func dispatch(dst *Objects, node *yaml.Node) error {
+	var tm typeMeta
+	if err := node.Decode(&tm); err != nil {
+		return nil // not a k8s object we can classify; skip
+	}
+	switch tm.Kind {
+	case "HTTPRoute":
+		var o HTTPRoute
+		if err := node.Decode(&o); err != nil {
+			return fmt.Errorf("decoding HTTPRoute: %w", err)
+		}
+		dst.HTTPRoutes = append(dst.HTTPRoutes, o)
+	case "Service":
+		var o Service
+		if err := node.Decode(&o); err != nil {
+			return fmt.Errorf("decoding Service: %w", err)
+		}
+		dst.Services = append(dst.Services, o)
+	case "EndpointSlice":
+		var o EndpointSlice
+		if err := node.Decode(&o); err != nil {
+			return fmt.Errorf("decoding EndpointSlice: %w", err)
+		}
+		dst.EndpointSlices = append(dst.EndpointSlices, o)
+	case "Deployment", "StatefulSet", "DaemonSet":
+		var o Workload
+		if err := node.Decode(&o); err != nil {
+			return fmt.Errorf("decoding %s: %w", tm.Kind, err)
+		}
+		dst.Workloads = append(dst.Workloads, o)
+	case "List":
+		var list struct {
+			Items []yaml.Node `yaml:"items"`
+		}
+		if err := node.Decode(&list); err != nil {
+			return fmt.Errorf("decoding List: %w", err)
+		}
+		for i := range list.Items {
+			if err := dispatch(dst, &list.Items[i]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
