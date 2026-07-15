@@ -127,14 +127,62 @@ type ContainerPort struct {
 	Protocol      string `yaml:"protocol"`
 }
 
+// ── Flux Helm objects (for optional HelmRelease rendering) ───────────────────
+// Enough of the Flux CRDs to locate a chart and its values; rendering happens in the helm
+// package by shelling out to `helm template`.
+
+type HelmRelease struct {
+	Metadata ObjectMeta `yaml:"metadata"`
+	Spec     struct {
+		ReleaseName     string `yaml:"releaseName"`
+		TargetNamespace string `yaml:"targetNamespace"`
+		Chart           struct {
+			Spec struct {
+				Chart     string    `yaml:"chart"`
+				Version   string    `yaml:"version"`
+				SourceRef SourceRef `yaml:"sourceRef"`
+			} `yaml:"spec"`
+		} `yaml:"chart"`
+		ChartRef SourceRef `yaml:"chartRef"`
+		Values   yaml.Node `yaml:"values"`
+	} `yaml:"spec"`
+}
+
+type SourceRef struct {
+	Kind      string `yaml:"kind"`
+	Name      string `yaml:"name"`
+	Namespace string `yaml:"namespace"`
+}
+
+type HelmRepository struct {
+	Metadata ObjectMeta `yaml:"metadata"`
+	Spec     struct {
+		URL  string `yaml:"url"`
+		Type string `yaml:"type"` // "oci" for an OCI-hosted Helm repo, else a classic index repo
+	} `yaml:"spec"`
+}
+
+type OCIRepository struct {
+	Metadata ObjectMeta `yaml:"metadata"`
+	Spec     struct {
+		URL string `yaml:"url"` // oci://host/path/chart
+		Ref struct {
+			Tag string `yaml:"tag"`
+		} `yaml:"ref"`
+	} `yaml:"spec"`
+}
+
 // ── Object set ───────────────────────────────────────────────────────────────
 
 // Objects is everything PolySieve extracted from a rendered manifest stream.
 type Objects struct {
-	HTTPRoutes     []HTTPRoute
-	Services       []Service
-	EndpointSlices []EndpointSlice
-	Workloads      []Workload
+	HTTPRoutes       []HTTPRoute
+	Services         []Service
+	EndpointSlices   []EndpointSlice
+	Workloads        []Workload
+	HelmReleases     []HelmRelease
+	HelmRepositories []HelmRepository
+	OCIRepositories  []OCIRepository
 }
 
 // typeMeta is used to route each YAML document to its decoder.
@@ -197,6 +245,24 @@ func dispatch(dst *Objects, node *yaml.Node) error {
 			return fmt.Errorf("decoding %s: %w", tm.Kind, err)
 		}
 		dst.Workloads = append(dst.Workloads, o)
+	case "HelmRelease":
+		var o HelmRelease
+		if err := node.Decode(&o); err != nil {
+			return fmt.Errorf("decoding HelmRelease: %w", err)
+		}
+		dst.HelmReleases = append(dst.HelmReleases, o)
+	case "HelmRepository":
+		var o HelmRepository
+		if err := node.Decode(&o); err != nil {
+			return fmt.Errorf("decoding HelmRepository: %w", err)
+		}
+		dst.HelmRepositories = append(dst.HelmRepositories, o)
+	case "OCIRepository":
+		var o OCIRepository
+		if err := node.Decode(&o); err != nil {
+			return fmt.Errorf("decoding OCIRepository: %w", err)
+		}
+		dst.OCIRepositories = append(dst.OCIRepositories, o)
 	case "List":
 		var list struct {
 			Items []yaml.Node `yaml:"items"`

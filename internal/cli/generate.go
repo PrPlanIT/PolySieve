@@ -10,6 +10,7 @@ import (
 
 	"github.com/PrPlanIT/PolySieve/internal/cluster"
 	"github.com/PrPlanIT/PolySieve/internal/discovery"
+	"github.com/PrPlanIT/PolySieve/internal/helm"
 	"github.com/PrPlanIT/PolySieve/internal/profile"
 	"github.com/PrPlanIT/PolySieve/internal/profile/dungeon"
 )
@@ -53,6 +54,17 @@ func run(cmd *cobra.Command, write bool) error {
 			fmt.Fprintf(os.Stderr, "cluster augmentation unavailable (%v);\nderiving from the repo alone — blind backends will be preserved, not resolved\n", err)
 		} else {
 			fmt.Fprintln(os.Stderr, "cluster augmentation: applied (blind backends resolved from live-cluster state where present)")
+		}
+	}
+	if flagHelm {
+		// Best-effort: render HelmReleases so Helm-backed backends resolve without a cluster.
+		// Repo (and any cluster) objects were parsed first, so they stay authoritative.
+		sum := helm.Render(cmd.Context(), flagHelmBin, objs)
+		if len(sum.Rendered) > 0 {
+			fmt.Fprintf(os.Stderr, "helm rendering: %d HelmRelease(s) rendered\n", len(sum.Rendered))
+		}
+		for _, s := range sum.Skipped {
+			fmt.Fprintln(os.Stderr, "helm rendering skipped —", s)
 		}
 	}
 	committed := func(path string) ([]byte, error) {

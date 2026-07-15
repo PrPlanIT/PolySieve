@@ -31,6 +31,12 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 go install sigs.k8s.io/kustomize/kustomize/v5@${KUSTOMIZE_VERSION}
 
+# helm — for best-effort `--helm` HelmRelease rendering, built from source via the module proxy.
+ARG HELM_VERSION=v3.16.4
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=0 go install helm.sh/helm/v3/cmd/helm@${HELM_VERSION}
+
 # ---- Runtime image ----
 FROM docker.io/library/alpine:3.24.1
 
@@ -48,5 +54,7 @@ COPY --from=builder /go/bin/kustomize /usr/local/bin/kustomize
 # kubectl — for best-effort `--cluster` augmentation. Sourced from the sanctioned alpine/k8s
 # image (musl-compatible, pulled through the registry mirror — no dl.k8s.io egress).
 COPY --from=docker.io/alpine/k8s:1.34.0 /usr/bin/kubectl /usr/local/bin/kubectl
+# helm — for best-effort `--helm` HelmRelease rendering (built in the Go stage).
+COPY --from=builder /go/bin/helm /usr/local/bin/helm
 
 ENTRYPOINT ["/usr/local/bin/polysieve"]

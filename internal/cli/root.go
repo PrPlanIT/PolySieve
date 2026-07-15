@@ -15,6 +15,8 @@ var (
 	flagRoots     []string
 	flagCluster   bool
 	flagKubectl   string
+	flagHelm      bool
+	flagHelmBin   string
 	flagVerbose   bool
 )
 
@@ -35,6 +37,8 @@ func init() {
 	rootCmd.PersistentFlags().StringSliceVar(&flagRoots, "root", nil, "override the profile's kustomize build roots (repeatable)")
 	rootCmd.PersistentFlags().BoolVar(&flagCluster, "cluster", false, "best-effort: resolve blind (Helm/operator) backends from the live cluster when reachable")
 	rootCmd.PersistentFlags().StringVar(&flagKubectl, "kubectl", "kubectl", "kubectl binary for --cluster augmentation")
+	rootCmd.PersistentFlags().BoolVar(&flagHelm, "helm", false, "best-effort: render HelmReleases with `helm template` to resolve Helm-backed backends (needs chart-registry network)")
+	rootCmd.PersistentFlags().StringVar(&flagHelmBin, "helm-bin", "helm", "helm binary for --helm rendering")
 	rootCmd.PersistentFlags().BoolVarP(&flagVerbose, "verbose", "v", false, "verbose output")
 }
 
