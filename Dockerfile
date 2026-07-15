@@ -34,7 +34,7 @@ LABEL org.opencontainers.image.title="PolySieve" \
       org.opencontainers.image.vendor="PrPlanIT"
 
 # kustomize — PolySieve renders the repo by shelling out to it.
-ARG KUSTOMIZE_VERSION=v5.8.0
+ARG KUSTOMIZE_VERSION=vkustomize/v5.8.1
 RUN apk add --no-cache ca-certificates && \
     wget -qO- "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
       | tar -xz -C /usr/local/bin kustomize
