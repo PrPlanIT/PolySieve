@@ -3,9 +3,16 @@ version: 1
 ci:
   image: docker.cr.pcfae.com/prplanit/stagefreight:latest-dev
 
-matchers:
+git:
   branches:
     main: "^main$"
+  tags:
+    stable:     { pattern: "^v?\\d+\\.\\d+\\.\\d+$" }
+    prerelease: { pattern: "^v?\\d+\\.\\d+\\.\\d+-.+" }
+  versioning:
+    branch_builds:
+      default: { base_from: [stable], format: "{base}-dev+{sha}" }
+    no_lineage: { mode: error }
 
 vars:
   org: prplanit
@@ -14,27 +21,14 @@ vars:
   repo: polysieve
   github_repo: PolySieve
 
-versioning:
-  tag_sources:
-    - id: stable
-      pattern: "^v?\\d+\\.\\d+\\.\\d+$"
-    - id: prerelease
-      pattern: "^v?\\d+\\.\\d+\\.\\d+-.+"
-  branch_builds:
-    - id: default
-      base_from: [stable]
-      format: "{base}-dev+{sha}"
-  no_lineage:
-    mode: error
-
 builds:
-  # The image is a regular multi-stage Dockerfile build (not StageFreight's
-  # self-build crucible). It produces a scratch image: the Go binary + restic.
-  - id: polysieve
+  # The image is a regular multi-stage Dockerfile build (not StageFreight's self-build
+  # crucible). It produces a scratch image: the Go binary + restic.
+  polysieve:
     kind: docker
     platforms: [linux/amd64]
 
-  - id: polysieve-bin
+  polysieve-bin:
     kind: binary
     builder: go
     from: ./cmd/polysieve
@@ -46,18 +40,18 @@ builds:
     platforms: [linux/amd64, linux/arm64]
 
 forges:
-  - id: gitlab
+  gitlab:
     provider: gitlab
     url: "https://gitlab.prplanit.com"
     credentials: GITLAB
 
-  - id: github
+  github:
     provider: github
     url: "https://github.com"
     credentials: GITHUB
 
 repos:
-  - id: primary
+  primary:
     forge: gitlab
     project: "{var:gitlab_group}/{var:repo}"
     roles: [primary]
@@ -65,7 +59,7 @@ repos:
       default: main
     worktree: "."
 
-  - id: github-mirror
+  github-mirror:
     forge: github
     project: "{var:github_org}/{var:github_repo}"
     roles: [mirror, publish-origin]
@@ -74,39 +68,39 @@ repos:
       releases: true
 
 registries:
-  - id: dockerhub
+  dockerhub:
     provider: docker
     url: docker.io
     credentials: DOCKER
     default_path: "{var:org}/{var:repo}"
 
-  - id: harbor
+  harbor:
     provider: harbor
     url: cr.pcfae.com
     credentials: HARBOR
     default_path: "{var:org}/{var:repo}"
 
-targets:
-  # ── Docker Hub: stable releases ─────────────────────────────────
-  - id: dockerhub-stable
+publish:
+  # ── Stable releases → all registries ──
+  stable:
     kind: registry
-    registry: dockerhub
+    registry: [dockerhub, harbor]
     build: polysieve
     tags: ["v{version}", "latest"]
     when: { git_tags: [stable], events: [tag] }
 
-  # ── Docker Hub: pre-releases (alpha/beta/rc) ────────────────────
-  - id: dockerhub-prerelease
+  # ── Pre-releases ──
+  prerelease:
     kind: registry
-    registry: dockerhub
+    registry: [dockerhub, harbor]
     build: polysieve
     tags: ["v{version}"]
     when: { git_tags: [prerelease], events: [tag] }
 
-  # ── Docker Hub: dev builds on every commit ───────────────────────
-  - id: dockerhub-dev
+  # ── Dev builds on every commit → all registries (retained/pruned) ──
+  dev:
     kind: registry
-    registry: dockerhub
+    registry: [dockerhub, harbor]
     build: polysieve
     tags: ["dev-{sha:8}", "latest-dev"]
     when: { branches: [main], events: [push] }
@@ -114,70 +108,44 @@ targets:
       keep_last: 6
       protect: ["latest-dev"]
 
-  # ── Harbor: dev builds on every commit ──────────────────────────
-  - id: harbor-dev
-    kind: registry
-    registry: harbor
-    build: polysieve
-    tags: ["dev-{sha:8}", "latest-dev"]
-    when: { branches: [main], events: [push] }
-
-  # ── Harbor: stable releases ─────────────────────────────────
-  - id: harbor-stable
-    kind: registry
-    registry: harbor
-    build: polysieve
-    tags: ["v{version}", "latest"]
-    when: { git_tags: [stable], events: [tag] }
-
-  # ── Docker Hub: README sync ──────────────────────────────────────
-  - id: dockerhub-readme
-    kind: docker-readme
-    registry: dockerhub
+  # ── Project metadata: registry overviews + forge repos ──
+  project-metadata:
+    kind: metadata
+    registry: [dockerhub, harbor]
+    repos: [primary, github-mirror]
+    readme: README.md
+    description:
+      - "Derive Kubernetes network-authorization policy from a GitOps repository's own manifests."
+    topics: [kubernetes, network-policy, gitops, security, go, cilium]
     when: { branches: [main], events: [push, tag] }
-    file: "README.md"
-    description: "Derive Kubernetes network authorization policy from a GitOps repository's own manifests."
 
-  # ── Binary archives: linux amd64/arm64 + SHA256SUMS ──────────────
-  - id: polysieve-binaries
+  # ── Binary archives: linux amd64/arm64 + SHA256SUMS (feeds both releases) ──
+  polysieve-binaries:
     kind: binary-archive
     build: polysieve-bin
     name: "polysieve-{version}-{os}-{arch}"
     format: auto
     checksums: true
-    when: { git_tags: [stable], events: [tag] }
+    when:
+      - { git_tags: [stable], events: [tag] }
+      - { branches: [main], events: [push] }
 
-  # ── Primary release (rolling git tag aliases + binaries) ─────────
-  - id: primary-release
+  # ── Primary release (rolling git tag aliases + binaries) ──
+  # Authored on the primary forge (GitLab); mirrored to GitHub via
+  # repos.github-mirror.sync.releases (no separate github release target).
+  primary-release:
     kind: release
     type: latest
+    repos: [primary]
     archives: polysieve-binaries
     aliases: ["v{version}", "latest"]
     when: { git_tags: [stable], events: [tag] }
 
-  # ── GitHub release (mirror) with binaries ────────────────────────
-  - id: github-release
+  # ── Dev binary release channel (GitLab): rolling latest-dev + retained dev-{sha8} ──
+  dev-release:
     kind: release
-    type: latest
-    mirror: github-mirror
-    sync_release: true
+    repos: [primary]
     archives: polysieve-binaries
-    when: { git_tags: [stable], events: [tag] }
-
-  # ── Dev binary archive: on every commit to main ──────────────────
-  - id: polysieve-binaries-dev
-    kind: binary-archive
-    build: polysieve-bin
-    name: "polysieve-{version}-{os}-{arch}"
-    format: auto
-    checksums: true
-    when: { branches: [main], events: [push] }
-
-  # ── Dev binary release channel (GitLab): rolling latest-dev +
-  #    retained immutable dev-{sha8}, pruned like the docker dev images.
-  - id: dev-release
-    kind: release
-    archives: polysieve-binaries-dev
     tag: "dev-{sha:8}"
     aliases: ["latest-dev"]
     type: prerelease
@@ -189,7 +157,7 @@ targets:
 build_cache:
   mode: hybrid
   external:
-    target: harbor-dev
+    registry: harbor
     path: "cache"
     fallback: "main"
   local:
@@ -218,23 +186,19 @@ dependency:
 lint:
   level: full
   exclude:
-    - "*.ttf"
     - "*.png"
-    - "*.jpg"
+    - "*.svg"
     - "*.ico"
-    - "*.woff"
-    - "*.woff2"
   modules:
     freshness:
       enabled: true
-      options:
-        cache_ttl: 300
-        sources:
-          docker_images: true
-          github_releases: true
-          go_modules: true
-        vulnerability:
-          enabled: true
+      cache_ttl: 300
+      sources:
+        docker_images: true
+        github_releases: true
+        go_modules: true
+      vulnerability:
+        enabled: true
     tabs:
       enabled: true
     secrets:
@@ -247,14 +211,13 @@ lint:
       enabled: true
     unicode:
       enabled: true
-      options:
-        detect_bidi: true
-        detect_zero_width: true
-        detect_control_ascii: true
+      detect_bidi: true
+      detect_zero_width: true
+      detect_control_ascii: true
 
 release:
   enabled: true
-  security_summary: ".stagefreight/security"
+  security_summary: true
   registry_links: true
 
 security:
@@ -264,188 +227,60 @@ security:
   release_detail: full
 
 toolchains:
-  desired:
-    trivy:
-      version: "0.69.3"
-    syft:
-      version: "1.42.3"
-    grype:
-      version: "0.110.0"
-    osv-scanner:
-      version: "2.3.5"
-    cosign:
-      version: "3.0.6"
+  trivy: "0.69.3"
+  syft: "1.42.3"
+  grype: "0.110.0"
+  osv-scanner: "2.3.5"
+  cosign: "3.0.6"
 
-narrate:
+# stencils: define each renderable once (id → stencil def). Inline defs render a
+# badge (default) or a shield (render: shield); named producers render via type.
+stencils:
+  # ── generated badges ──
+  build:   { label: build,   message: "{env:BUILD_STATUS}", color: auto, font: monofur, link: "https://gitlab.prplanit.com/{var:gitlab_group}/{var:repo}/-/pipelines" }
+  license: { label: license, message: "AGPL-3.0-only", color: "#310937", font: monofur, link: LICENSE }
+  release: { label: release, message: "v{base}", color: "#74ecbe", font: dejavu-sans, font_size: 11, link: "https://github.com/{var:github_org}/{var:github_repo}/releases" }
+  updated: { label: updated, message: "{env:BUILD_DATE}", color: "#236144", font: dejavu-sans, font_size: 11 }
+  pulls:   { label: pulls,   message: "{docker.pulls}", color: "#1d63ed", link: "https://hub.docker.com/r/{var:org}/{var:repo}" }
+
+  # ── inline shields ──
+  donate:  { render: shield, message: donate,  color: "#FF5E5B", logo: ko-fi,          logo_color: white, link: "https://ko-fi.com/T6T41IT163" }
+  sponsor: { render: shield, message: sponsor, color: "#EA4AAA", logo: githubsponsors, logo_color: white, link: "https://github.com/sponsors/{var:github_org}" }
+  github:  { render: shield, label: GitHub, message: source, color: "#181717", logo: github, link: "https://github.com/{var:github_org}/{var:github_repo}" }
+  gitlab:  { render: shield, label: GitLab, message: source, color: "#FC6D26", logo: gitlab, link: "https://gitlab.prplanit.com/{var:gitlab_group}/{var:repo}" }
+  docker:  { render: shield, label: Docker, message: "{var:org}/{var:repo}", color: "#2496ED", logo: docker, logo_color: white, link: "https://hub.docker.com/r/{var:org}/{var:repo}" }
+
+  # ── named producers (repo resolves from repos: publish-origin) ──
+  go-report:    { type: goreportcard }
+  last-commit:  { type: github-last-commit }
+  issues-open:  { type: github-issues-open }
+  prs-open:     { type: github-prs-open }
+  contributors: { type: github-contributors }
+
+scribe:
+  files:
+    readme.badges:
+      file: "README.md"
+      between: ["<!-- sf:badges:start -->", "<!-- sf:badges:end -->"]
+      inline: true
+      items: [build, license, release, updated, donate, sponsor]
+
+    readme.project:
+      file: "README.md"
+      between: ["<!-- sf:project:start -->", "<!-- sf:project:end -->"]
+      inline: true
+      items: [github, gitlab, go-report, last-commit, issues-open, prs-open, contributors]
+
+    readme.image:
+      file: "README.md"
+      between: ["<!-- sf:image:start -->", "<!-- sf:image:end -->"]
+      items: [docker, pulls]
+
   commit:
     type: docs
     message: "refresh generated docs and badges"
     add:
       - "README.md"
-      - ".stagefreight/badges"
+      - ".stagefreight/scribe"
     push: true
     skip_ci: true
-  badges:
-    - id: build
-      text: build
-      value: "{env:BUILD_STATUS}"
-      color: auto
-      font: monofur
-      output: ".stagefreight/badges/build.svg"
-      link: "https://gitlab.prplanit.com/{var:gitlab_group}/{var:repo}/-/pipelines"
-    - id: license
-      text: license
-      value: "AGPL-3.0-only"
-      color: "#310937"
-      font: monofur
-      output: ".stagefreight/badges/license.svg"
-      link: LICENSE
-    - id: release
-      text: release
-      value: "v{base}"
-      color: "#74ecbe"
-      font: dejavu-sans
-      font_size: 11
-      output: ".stagefreight/badges/release.svg"
-      link: "https://github.com/{var:github_org}/{var:github_repo}/releases"
-    - id: updated
-      text: updated
-      value: "{env:BUILD_DATE}"
-      color: "#236144"
-      font: dejavu-sans
-      font_size: 11
-      output: ".stagefreight/badges/updated.svg"
-    - id: pulls
-      text: pulls
-      value: "{docker.pulls}"
-      color: "#1d63ed"
-      output: ".stagefreight/badges/pulls.svg"
-      link: "https://hub.docker.com/r/{var:org}/{var:repo}"
-    - id: release-latest
-      text: latest
-      value: "v{base}"
-      color: "#74ecbe"
-      output: ".stagefreight/badges/latest.svg"
-      link: "https://hub.docker.com/r/{var:org}/{var:repo}/tags?name=latest"
-    - id: dev-latest
-      text: latest-dev
-      value: "dev-{sha:8}"
-      color: "#3b82f6"
-      output: ".stagefreight/badges/latest-dev.svg"
-      link: "https://hub.docker.com/r/{var:org}/{var:repo}/tags?name=latest-dev"
-    - id: dev-updated
-      text: updated
-      value: "{docker.tag.latest-dev.updated}"
-      color: "#236144"
-      output: ".stagefreight/badges/dev-updated.svg"
-    - id: dev-size
-      text: size
-      value: "{docker.tag.latest-dev.size}"
-      color: "#555"
-      output: ".stagefreight/badges/dev-size.svg"
-      link: "https://hub.docker.com/r/{var:org}/{var:repo}/tags?name=latest-dev"
-  patches:
-    - file: "README.md"
-      items:
-        - id: badge.build
-          kind: badge_ref
-          ref: build
-          placement:
-            between: ["<!-- sf:badges:start -->", "<!-- sf:badges:end -->"]
-            mode: replace
-            inline: true
-        - id: badge.license
-          kind: badge_ref
-          ref: license
-          placement:
-            between: ["<!-- sf:badges:start -->", "<!-- sf:badges:end -->"]
-            mode: replace
-            inline: true
-        - id: badge.release
-          kind: badge_ref
-          ref: release
-          placement:
-            between: ["<!-- sf:badges:start -->", "<!-- sf:badges:end -->"]
-            mode: replace
-            inline: true
-        - id: badge.updated
-          kind: badge_ref
-          ref: updated
-          placement:
-            between: ["<!-- sf:badges:start -->", "<!-- sf:badges:end -->"]
-            mode: replace
-            inline: true
-        - id: shield.donate
-          kind: shield
-          placement:
-            between: ["<!-- sf:badges:start -->", "<!-- sf:badges:end -->"]
-            mode: replace
-            inline: true
-          shield: "badge/donate-FF5E5B?logo=ko-fi&logoColor=white"
-          link: "https://ko-fi.com/T6T41IT163"
-        - id: shield.sponsor
-          kind: shield
-          placement:
-            between: ["<!-- sf:badges:start -->", "<!-- sf:badges:end -->"]
-            mode: replace
-            inline: true
-          shield: "badge/sponsor-EA4AAA?logo=githubsponsors&logoColor=white"
-          link: "https://github.com/sponsors/{var:github_org}"
-
-        - id: project.github
-          kind: shield
-          placement:
-            between: ["<!-- sf:project:start -->", "<!-- sf:project:end -->"]
-            mode: replace
-            inline: true
-          shield: "badge/GitHub-source-181717?logo=github"
-          link: "https://github.com/{var:github_org}/{var:github_repo}"
-        - id: project.gitlab
-          kind: shield
-          placement:
-            between: ["<!-- sf:project:start -->", "<!-- sf:project:end -->"]
-            mode: replace
-            inline: true
-          shield: "badge/GitLab-source-FC6D26?logo=gitlab"
-          link: "https://gitlab.prplanit.com/{var:gitlab_group}/{var:repo}"
-        - id: project.last-commit
-          kind: props
-          type: github-last-commit
-          placement:
-            between: ["<!-- sf:project:start -->", "<!-- sf:project:end -->"]
-            mode: replace
-            inline: true
-          params:
-            repo: "{var:github_org}/{var:github_repo}"
-        - id: project.issues-open
-          kind: props
-          type: github-issues-open
-          placement:
-            between: ["<!-- sf:project:start -->", "<!-- sf:project:end -->"]
-            mode: replace
-            inline: true
-          params:
-            repo: "{var:github_org}/{var:github_repo}"
-        - id: project.contributors
-          kind: props
-          type: github-contributors
-          placement:
-            between: ["<!-- sf:project:start -->", "<!-- sf:project:end -->"]
-            mode: replace
-            inline: true
-          params:
-            repo: "{var:github_org}/{var:github_repo}"
-
-        - id: image.docker
-          kind: shield
-          placement:
-            between: ["<!-- sf:image:start -->", "<!-- sf:image:end -->"]
-            mode: replace
-          shield: "badge/Docker-{var:org}%2F{var:repo}-2496ED?logo=docker&logoColor=white"
-          link: "https://hub.docker.com/r/{var:org}/{var:repo}"
-        - id: image.pulls
-          kind: badge_ref
-          ref: pulls
-          placement:
-            between: ["<!-- sf:image:start -->", "<!-- sf:image:end -->"]
-            mode: replace
