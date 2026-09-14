@@ -6,6 +6,7 @@ package discovery
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/PrPlanIT/PolySieve/internal/kube"
 )
@@ -33,7 +34,7 @@ type RouteGraph struct {
 	Backends []Backend
 	Objects  *kube.Objects
 
-	svcIndex   map[string]kube.Service        // "ns/name" → Service (first occurrence wins)
+	svcIndex   map[string]kube.Service         // "ns/name" → Service (first occurrence wins)
 	sliceIndex map[string][]kube.EndpointSlice // "ns/serviceName" → slices
 }
 
@@ -86,6 +87,41 @@ func Build(objs *kube.Objects) *RouteGraph {
 	return g
 }
 
+// IngressGateway is a discovered Gateway that participates in a profile's ingress contract.
+// Its identity is read straight from the manifest — no gateway names or namespaces are baked
+// into PolySieve — so the same engine derives policy for any cluster whose ingress gateways
+// wear the contract labels.
+type IngressGateway struct {
+	Name      string // Gateway resource name (matches a route's parentRef name)
+	Namespace string // where the Gateway — and thus its data-plane ServiceAccount — lives
+	Class     string // short instance name used to group/label the derived policy
+}
+
+// IngressGateways returns the Gateways whose infrastructure labels mark them as ingress
+// gateways under the caller's contract, keyed by Gateway name. A Gateway qualifies when it
+// carries classLabelKey=classLabelVal; its Class is read from instanceLabelKey, falling back
+// to the Gateway name with a trailing "-gateway" removed. This is a generic mechanism: the
+// profile supplies the label keys, keeping every cluster-specific value out of the engine.
+func (g *RouteGraph) IngressGateways(classLabelKey, classLabelVal, instanceLabelKey string) map[string]IngressGateway {
+	out := map[string]IngressGateway{}
+	for _, gw := range g.Objects.Gateways {
+		labels := gw.Spec.Infrastructure.Labels
+		if labels[classLabelKey] != classLabelVal {
+			continue
+		}
+		class := labels[instanceLabelKey]
+		if class == "" {
+			class = strings.TrimSuffix(gw.Metadata.Name, "-gateway")
+		}
+		out[gw.Metadata.Name] = IngressGateway{
+			Name:      gw.Metadata.Name,
+			Namespace: gw.Metadata.Namespace,
+			Class:     class,
+		}
+	}
+	return out
+}
+
 // ResolvePort maps a (namespace, service, service-port) to the concrete backend port; see
 // ResolvePortEx for the resolution rules. The boolean (did-we-resolve-or-guess) is dropped.
 func (g *RouteGraph) ResolvePort(ns, svc string, svcPort int) int {
@@ -96,8 +132,10 @@ func (g *RouteGraph) ResolvePort(ns, svc string, svcPort int) int {
 // ResolvePortEx maps a (namespace, service, service-port) to the concrete backend port and
 // reports whether the value is a real resolution (true) or a fallback guess (false), mirroring
 // the reference resolver exactly:
-//   Service.spec.ports[port==svcPort].targetPort // .port; numeric → use it; omitted → the
-//   service port (defaults to it); named → the EndpointSlice port of that name.
+//
+//	Service.spec.ports[port==svcPort].targetPort // .port; numeric → use it; omitted → the
+//	service port (defaults to it); named → the EndpointSlice port of that name.
+//
 // It falls back to the service port — and reports false — when the Service is absent from the
 // repo, no port entry matches, or a named targetPort has no EndpointSlice to resolve it. Those
 // are exactly the cases where the pods are rendered outside the repo, so the "port" is a guess.
@@ -188,6 +226,7 @@ func (g *RouteGraph) WorkloadsWithPodLabel(label, value string) []int {
 //     chart or an operator), so their non-routed ports cannot be known from the repo;
 //   - no selector (external / manually-endpointed service) → treated as visible: it isn't
 //     workload-backed, and what ports it exposes is declared on the Service/EndpointSlice.
+//
 // A service absent from the repo entirely is blind (nothing to see).
 func (g *RouteGraph) ServiceHasVisibleWorkload(ns, svc string) bool {
 	s, ok := g.svcIndex[ns+"/"+svc]

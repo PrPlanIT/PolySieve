@@ -12,6 +12,45 @@ import (
 // noCommitted is a CommittedReader with nothing on disk (the fully-derived path).
 func noCommitted(string) ([]byte, error) { return nil, nil }
 
+// gateways are the Gateway objects every fixture is rendered against. Identity is read from
+// here — nothing is baked into the profile — so the tests double as proof the derivation works
+// off arbitrary namespaces (xylem→arylls-lookout, phloem→prelude-of-light). neko-gateway
+// carries no ingress-contract client-class label, so it must be EXCLUDED by contract, not by a
+// hardcoded name.
+const gateways = `
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: xylem-gateway
+  namespace: arylls-lookout
+spec:
+  infrastructure:
+    labels:
+      policy.prplanit.com/client-class: ingress-gateway
+      policy.prplanit.com/ingress-instance: xylem
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: phloem-gateway
+  namespace: prelude-of-light
+spec:
+  infrastructure:
+    labels:
+      policy.prplanit.com/client-class: ingress-gateway
+      policy.prplanit.com/ingress-instance: phloem
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: neko-gateway
+  namespace: tingle-tuner
+spec:
+  infrastructure:
+    labels:
+      app: neko
+`
+
 // fixture exercises: port resolution (foo:3000 → targetPort 8080), a numeric-passthrough
 // (ceph-dashboard:8443), gateway exclusion (neko-gateway), a Gatus-annotated service, a
 // statically probe-labelled workload, and an ingress-labelled workload (probe via the
@@ -130,6 +169,11 @@ func renderFixture(t *testing.T) map[string]string {
 func renderWith(t *testing.T, src string, committed profile.CommittedReader) (map[string]string, profile.Report) {
 	t.Helper()
 	var objs kube.Objects
+	// Parse appends, so the Gateway objects and the fixture routes come from separate streams —
+	// avoids doc-boundary coupling and mirrors how PolySieve accumulates across rendered roots.
+	if err := kube.Parse(&objs, []byte(gateways)); err != nil {
+		t.Fatalf("parse gateways: %v", err)
+	}
 	if err := kube.Parse(&objs, []byte(src)); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -146,8 +190,18 @@ func renderWith(t *testing.T, src string, committed profile.CommittedReader) (ma
 
 func TestCiliumContract(t *testing.T) {
 	m := renderFixture(t)
+	// fromEndpoints is generated from the discovered ingress gateways' namespaces, sorted:
+	// arylls-lookout (xylem), prelude-of-light (phloem). neko has no contract label → excluded.
+	wantSources := "        # xylem-gateway\n" +
+		"        - matchLabels:\n" +
+		"            k8s:io.kubernetes.pod.namespace: arylls-lookout\n" +
+		"            policy.prplanit.com/client-class: ingress-gateway\n" +
+		"        # phloem-gateway\n" +
+		"        - matchLabels:\n" +
+		"            k8s:io.kubernetes.pod.namespace: prelude-of-light\n" +
+		"            policy.prplanit.com/client-class: ingress-gateway\n"
 	// ceph 8443 (numeric passthrough) + foo 3000→8080; excluded neko dropped. Sorted: 8080, 8443.
-	want := ciliumContractSkeleton +
+	want := ciliumContractHeader + wantSources + ciliumContractToPorts +
 		"            - port: \"8080\"\n              protocol: TCP\n" +
 		"            - port: \"8443\"\n              protocol: TCP\n"
 	got := m[ciliumBaseDir+"/ccnp-contract-ingress-backend.yaml"]
@@ -184,10 +238,11 @@ func TestIstioFiles(t *testing.T) {
 		t.Errorf("xylem header wrong:\n%s", xylem)
 	}
 
+	// Principal namespace is DERIVED from the phloem Gateway's manifest namespace, not baked.
 	phloem := m[istioOverlay+"/tingle-tuner/allow-gateway-ingress-phloem.yaml"]
-	if !strings.Contains(phloem, "sa/phloem-gateway-istio") ||
+	if !strings.Contains(phloem, "- cluster.local/ns/prelude-of-light/sa/phloem-gateway-istio") ||
 		!strings.HasSuffix(phloem, "            ports: [\"8080\"]\n") {
-		t.Errorf("tingle-tuner phloem wrong (resolved port 8080):\n%s", phloem)
+		t.Errorf("tingle-tuner phloem wrong (derived principal ns + resolved port 8080):\n%s", phloem)
 	}
 
 	if _, ok := m[istioOverlay+"/tingle-tuner/allow-gateway-ingress-neko.yaml"]; ok {

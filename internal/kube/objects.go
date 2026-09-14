@@ -52,15 +52,30 @@ type ObjectMeta struct {
 type HTTPRoute struct {
 	Metadata ObjectMeta `yaml:"metadata"`
 	Spec     struct {
-		ParentRefs  []ParentRef `yaml:"parentRefs"`
-		Rules       []struct {
+		ParentRefs []ParentRef `yaml:"parentRefs"`
+		Rules      []struct {
 			BackendRefs []BackendRef `yaml:"backendRefs"`
 		} `yaml:"rules"`
 	} `yaml:"spec"`
 }
 
 type ParentRef struct {
-	Name string `yaml:"name"`
+	Name      string `yaml:"name"`
+	Namespace string `yaml:"namespace"` // optional; defaults to the route's namespace
+}
+
+// ── Gateway ────────────────────────────────────────────────────────────────────
+// The minimal Gateway API Gateway: PolySieve reads its identity (name/namespace) and the
+// infrastructure labels a profile uses to recognise it (e.g. an ingress-contract marker and
+// a short instance name). The gateway's namespace is where its data-plane ServiceAccount lives.
+
+type Gateway struct {
+	Metadata ObjectMeta `yaml:"metadata"`
+	Spec     struct {
+		Infrastructure struct {
+			Labels map[string]string `yaml:"labels"`
+		} `yaml:"infrastructure"`
+	} `yaml:"spec"`
 }
 
 type BackendRef struct {
@@ -88,8 +103,8 @@ type ServicePort struct {
 // ── EndpointSlice ────────────────────────────────────────────────────────────
 
 type EndpointSlice struct {
-	Metadata ObjectMeta      `yaml:"metadata"`
-	Ports    []EndpointPort  `yaml:"ports"`
+	Metadata ObjectMeta     `yaml:"metadata"`
+	Ports    []EndpointPort `yaml:"ports"`
 }
 
 type EndpointPort struct {
@@ -177,6 +192,7 @@ type OCIRepository struct {
 // Objects is everything PolySieve extracted from a rendered manifest stream.
 type Objects struct {
 	HTTPRoutes       []HTTPRoute
+	Gateways         []Gateway
 	Services         []Service
 	EndpointSlices   []EndpointSlice
 	Workloads        []Workload
@@ -227,6 +243,12 @@ func dispatch(dst *Objects, node *yaml.Node) error {
 			return fmt.Errorf("decoding HTTPRoute: %w", err)
 		}
 		dst.HTTPRoutes = append(dst.HTTPRoutes, o)
+	case "Gateway":
+		var o Gateway
+		if err := node.Decode(&o); err != nil {
+			return fmt.Errorf("decoding Gateway: %w", err)
+		}
+		dst.Gateways = append(dst.Gateways, o)
 	case "Service":
 		var o Service
 		if err := node.Decode(&o); err != nil {

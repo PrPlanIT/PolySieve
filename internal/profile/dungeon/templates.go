@@ -1,11 +1,13 @@
 package dungeon
 
-// Static skeletons captured verbatim from the dungeon's committed generated files. Each
-// cilium skeleton ends exactly at its first `        - ports:` line; the generated port
-// block is appended after it. The istio template is a fmt format string:
-// args are (gatewayClass, principalNamespace, principalName, inlinePortList).
+// Skeletons for the derived policy files. The cilium skeletons end exactly at their first
+// `        - ports:` line; the generated port block is appended after. The istio template is a
+// fmt format string whose args are (gatewayClass, principalNamespace, principalName,
+// inlinePortList). The contract-ingress-backend policy's fromEndpoints is generated from the
+// discovered ingress gateways (see ciliumContractSources), so its skeleton is split into a
+// header (up to `    - fromEndpoints:`) and a toPorts tail.
 
-const ciliumContractSkeleton = `# DERIVED: resolved pod targetPorts from HTTPRoute backendRefs.
+const ciliumContractHeader = `# DERIVED: resolved pod targetPorts from HTTPRoute backendRefs.
 # Inputs: HTTPRoutes → Services (targetPort resolution) → EndpointSlices (named port resolution)
 # Source of truth: hack/gen-cilium-backend-ports.sh
 # Regenerate; do not hand-edit.
@@ -16,10 +18,9 @@ metadata:
 spec:
   description: >-
     Contract: ingress gateway pods may reach backend application pods.
-    Source is restricted to the 3 gateway namespaces (arylls-lookout,
-    kokiri-forest, hyrule-castle) AND must carry the ingress-gateway
-    client-class label. Destination pods must carry
-    policy.prplanit.com/ingress: "true".
+    Source is restricted to the discovered ingress-gateway namespaces AND
+    must carry the ingress-gateway client-class label. Destination pods must
+    carry policy.prplanit.com/ingress: "true".
   enableDefaultDeny:
     egress: false
     ingress: false
@@ -28,19 +29,9 @@ spec:
       policy.prplanit.com/ingress: "true"
   ingress:
     - fromEndpoints:
-        # xylem-gateway (internal *.pcfae.com)
-        - matchLabels:
-            k8s:io.kubernetes.pod.namespace: arylls-lookout
-            policy.prplanit.com/client-class: ingress-gateway
-        # phloem-gateway (personal *.sofmeright.com, *.arbitorium.com, etc.)
-        - matchLabels:
-            k8s:io.kubernetes.pod.namespace: kokiri-forest
-            policy.prplanit.com/client-class: ingress-gateway
-        # cell-membrane-gateway (business *.prplanit.com, *.precisionplanit.com, etc.)
-        - matchLabels:
-            k8s:io.kubernetes.pod.namespace: hyrule-castle
-            policy.prplanit.com/client-class: ingress-gateway
-      toPorts:
+`
+
+const ciliumContractToPorts = `      toPorts:
         - ports:
 `
 
@@ -74,7 +65,7 @@ spec:
 
 const istioTemplate = `# DERIVED: pod targetPorts from HTTPRoute backendRefs targeting this namespace.
 # Inputs: HTTPRoutes → Services (targetPort resolution) → EndpointSlices (named port resolution)
-# Key: (gateway parentRef -> {xylem|phloem|cell-membrane}) + resolved targetPort
+# Key: (gateway parentRef -> discovered ingress-gateway class) + resolved targetPort
 # Regenerate; do not hand-edit.
 apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy

@@ -37,28 +37,35 @@ func (dungeon) Roots() []string {
 }
 
 // ── Gateway model ────────────────────────────────────────────────────────────
-// A route's parentRef name maps to a short gateway class by prefix; unrecognised gateways
-// (e.g. neko-gateway) are excluded. Each class has an Istio ServiceAccount identity.
+// The dungeon's ingress gateways are discovered from the repo, never hardcoded. A Gateway is
+// an ingress gateway when it carries the ingress-contract client-class label; its short class
+// (used to group and name the derived policy) comes from the ingress-instance label, and its
+// Istio data-plane ServiceAccount is "<gateway-name>-istio" in the Gateway's own namespace
+// (the Gateway-API/Istio default). Only these label keys and the SA convention are profile
+// knowledge — every gateway name and namespace is read from the manifests, so this profile
+// derives correct policy for any cluster that wears the same ingress contract.
+const (
+	clientClassLabel     = "policy.prplanit.com/client-class"
+	ingressGatewayValue  = "ingress-gateway"
+	ingressInstanceLabel = "policy.prplanit.com/ingress-instance"
+	saNameSuffix         = "-istio"
+)
 
-var gatewayClasses = []struct{ prefix, class string }{
-	{"xylem-gateway", "xylem"},
-	{"phloem-gateway", "phloem"},
-	{"cell-membrane-gateway", "cell-membrane"},
+// ingressGateways discovers the ingress gateways this profile derives policy for, keyed by
+// Gateway (== parentRef) name.
+func ingressGateways(g *discovery.RouteGraph) map[string]discovery.IngressGateway {
+	return g.IngressGateways(clientClassLabel, ingressGatewayValue, ingressInstanceLabel)
 }
 
-var gatewaySA = map[string][2]string{ // class → {SA namespace, SA name}
-	"xylem":         {"arylls-lookout", "xylem-gateway-istio"},
-	"phloem":        {"kokiri-forest", "phloem-gateway-istio"},
-	"cell-membrane": {"hyrule-castle", "cell-membrane-gateway-istio"},
+// classify returns the short class of a route's parentRef gateway, or "" when it is not a
+// discovered ingress gateway (e.g. neko-gateway) — such gateways are excluded from derivation.
+func classify(gws map[string]discovery.IngressGateway, gateway string) string {
+	return gws[gateway].Class
 }
 
-func classify(gateway string) string {
-	for _, gc := range gatewayClasses {
-		if strings.HasPrefix(gateway, gc.prefix) {
-			return gc.class
-		}
-	}
-	return ""
+// saPrincipal returns the SPIFFE principal of a discovered gateway's data-plane ServiceAccount.
+func saPrincipal(gw discovery.IngressGateway) (ns, name string) {
+	return gw.Namespace, gw.Name + saNameSuffix
 }
 
 const (
@@ -71,12 +78,13 @@ const (
 )
 
 func (d dungeon) Render(g *discovery.RouteGraph, committed profile.CommittedReader) ([]profile.File, profile.Report, error) {
-	blind := blindIngressServices(g)
-	routeBlind := routeBlindServices(g)
+	gws := ingressGateways(g)
+	blind := blindIngressServices(g, gws)
+	routeBlind := routeBlindServices(g, gws)
 
 	var files []profile.File
-	files = append(files, d.ciliumContract(g, committed), d.ciliumGatus(g, blind, committed))
-	files = append(files, d.istioGatewayIngress(g, committed)...)
+	files = append(files, d.ciliumContract(g, gws, committed), d.ciliumGatus(g, gws, blind, committed))
+	files = append(files, d.istioGatewayIngress(g, gws, committed)...)
 	return files, profile.Report{BlindServices: blind, RouteBlindServices: routeBlind}, nil
 }
 
@@ -84,8 +92,8 @@ func (d dungeon) Render(g *discovery.RouteGraph, committed profile.CommittedRead
 // workload is not visible in the repo — rendered by Helm or an operator. These are the backends
 // whose non-routed (container) ports the repo cannot describe, so the Gatus healthcheck
 // preserves rather than prunes while any remain unresolved.
-func blindIngressServices(g *discovery.RouteGraph) []string {
-	return uniqueBackendServices(g, func(b discovery.Backend) bool {
+func blindIngressServices(g *discovery.RouteGraph, gws map[string]discovery.IngressGateway) []string {
+	return uniqueBackendServices(g, gws, func(b discovery.Backend) bool {
 		return !g.ServiceHasVisibleWorkload(b.BackendNS, b.Service)
 	})
 }
@@ -93,17 +101,17 @@ func blindIngressServices(g *discovery.RouteGraph) []string {
 // routeBlindServices lists the ingress backends whose routed port could not be resolved from the
 // repo (Service absent, or a named targetPort with no EndpointSlice) — the port is a fallback
 // guess. The route-derived policies covering these backends preserve rather than prune.
-func routeBlindServices(g *discovery.RouteGraph) []string {
-	return uniqueBackendServices(g, func(b discovery.Backend) bool { return !b.Resolved })
+func routeBlindServices(g *discovery.RouteGraph, gws map[string]discovery.IngressGateway) []string {
+	return uniqueBackendServices(g, gws, func(b discovery.Backend) bool { return !b.Resolved })
 }
 
 // uniqueBackendServices returns the sorted, unique "ns/service" of classified ingress backends
 // matching pred.
-func uniqueBackendServices(g *discovery.RouteGraph, pred func(discovery.Backend) bool) []string {
+func uniqueBackendServices(g *discovery.RouteGraph, gws map[string]discovery.IngressGateway, pred func(discovery.Backend) bool) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, b := range g.Backends {
-		if classify(b.Gateway) == "" || !pred(b) {
+		if classify(gws, b.Gateway) == "" || !pred(b) {
 			continue
 		}
 		key := b.BackendNS + "/" + b.Service
@@ -119,12 +127,12 @@ func uniqueBackendServices(g *discovery.RouteGraph, pred func(discovery.Backend)
 // ── Cilium: contract-ingress-backend ─────────────────────────────────────────
 // Every resolved backend port reachable through the three ingress gateways, cluster-wide.
 
-func (d dungeon) ciliumContract(g *discovery.RouteGraph, committed profile.CommittedReader) profile.File {
+func (d dungeon) ciliumContract(g *discovery.RouteGraph, gws map[string]discovery.IngressGateway, committed profile.CommittedReader) profile.File {
 	path := ciliumBaseDir + "/ccnp-contract-ingress-backend.yaml"
 	var ports []int
 	blind := false
 	for _, b := range g.Backends {
-		if classify(b.Gateway) == "" {
+		if classify(gws, b.Gateway) == "" {
 			continue
 		}
 		if !b.Resolved {
@@ -143,14 +151,39 @@ func (d dungeon) ciliumContract(g *discovery.RouteGraph, committed profile.Commi
 	ports = discovery.SortDedupInts(ports)
 	return profile.File{
 		Path:    path,
-		Content: []byte(ciliumContractSkeleton + ciliumPortBlock(ports)),
+		Content: []byte(ciliumContractHeader + ciliumContractSources(gws) + ciliumContractToPorts + ciliumPortBlock(ports)),
 	}
+}
+
+// ciliumContractSources renders the contract's fromEndpoints — one matchLabels block per
+// discovered ingress-gateway namespace (deduped, sorted for deterministic output). Each block
+// selects that namespace's ingress-gateway pods; the namespaces come from the manifests.
+func ciliumContractSources(gws map[string]discovery.IngressGateway) string {
+	byNS := map[string][]string{}
+	for _, gw := range gws {
+		byNS[gw.Namespace] = append(byNS[gw.Namespace], gw.Name)
+	}
+	nss := make([]string, 0, len(byNS))
+	for ns := range byNS {
+		nss = append(nss, ns)
+	}
+	sort.Strings(nss)
+	var b strings.Builder
+	for _, ns := range nss {
+		names := byNS[ns]
+		sort.Strings(names)
+		fmt.Fprintf(&b, "        # %s\n", strings.Join(names, ", "))
+		b.WriteString("        - matchLabels:\n")
+		fmt.Fprintf(&b, "            k8s:io.kubernetes.pod.namespace: %s\n", ns)
+		fmt.Fprintf(&b, "            %s: %s\n", clientClassLabel, ingressGatewayValue)
+	}
+	return b.String()
 }
 
 // ── Cilium: allow-gatus-healthcheck ──────────────────────────────────────────
 // Ports Gatus probes: annotated-service targetPorts + probe-labelled workload containerPorts.
 
-func (d dungeon) ciliumGatus(g *discovery.RouteGraph, blind []string, committed profile.CommittedReader) profile.File {
+func (d dungeon) ciliumGatus(g *discovery.RouteGraph, gws map[string]discovery.IngressGateway, blind []string, committed profile.CommittedReader) profile.File {
 	path := ciliumBaseDir + "/ccnp-allow-gatus-healthcheck.yaml"
 
 	var ports []int
@@ -177,7 +210,7 @@ func (d dungeon) ciliumGatus(g *discovery.RouteGraph, blind []string, committed 
 	// backend behind an ingress gateway is probe-eligible. Non-routed ports are covered by the
 	// preserve gate below.
 	for _, b := range g.Backends {
-		if classify(b.Gateway) == "" || g.ServiceHasVisibleWorkload(b.BackendNS, b.Service) {
+		if classify(gws, b.Gateway) == "" || g.ServiceHasVisibleWorkload(b.BackendNS, b.Service) {
 			continue
 		}
 		if !b.Resolved {
@@ -230,7 +263,13 @@ func extractPorts(b []byte) []int {
 // One file per (backend namespace, gateway class), allowing that gateway's SA to reach the
 // namespace's ingress-labelled pods on the resolved backend ports.
 
-func (d dungeon) istioGatewayIngress(g *discovery.RouteGraph, committed profile.CommittedReader) []profile.File {
+func (d dungeon) istioGatewayIngress(g *discovery.RouteGraph, gws map[string]discovery.IngressGateway, committed profile.CommittedReader) []profile.File {
+	// class → discovered gateway, for resolving each policy's SA principal from the manifest.
+	byClass := map[string]discovery.IngressGateway{}
+	for _, gw := range gws {
+		byClass[gw.Class] = gw
+	}
+
 	type key struct{ ns, class string }
 	type group struct {
 		ports []int
@@ -238,7 +277,7 @@ func (d dungeon) istioGatewayIngress(g *discovery.RouteGraph, committed profile.
 	}
 	groups := map[key]*group{}
 	for _, b := range g.Backends {
-		c := classify(b.Gateway)
+		c := classify(gws, b.Gateway)
 		if c == "" {
 			continue
 		}
@@ -267,7 +306,7 @@ func (d dungeon) istioGatewayIngress(g *discovery.RouteGraph, committed profile.
 	var files []profile.File
 	for _, k := range keys {
 		gr := groups[k]
-		sa := gatewaySA[k.class]
+		saNS, saName := saPrincipal(byClass[k.class])
 		path := fmt.Sprintf("%s/%s/allow-gateway-ingress-%s.yaml", istioOverlay, k.ns, k.class)
 		ports := gr.ports
 		// Honesty gate: if any backend for this namespace routed to a guessed port, preserve the
@@ -281,7 +320,7 @@ func (d dungeon) istioGatewayIngress(g *discovery.RouteGraph, committed profile.
 			Path: path,
 			Content: []byte(fmt.Sprintf(istioTemplate,
 				k.class,      // metadata.name suffix
-				sa[0], sa[1], // principal ns / name
+				saNS, saName, // principal ns / name (from the discovered Gateway)
 				istioPortList(discovery.SortDedupInts(ports)), // inline flow list
 			)),
 		})
