@@ -38,7 +38,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go install helm.sh/helm/v3/cmd/helm@${HELM_VERSION}
 
 # ---- Runtime image ----
-FROM docker.io/library/alpine:3.24.1
+FROM docker.io/library/alpine:3.24.2
 
 LABEL org.opencontainers.image.title="PolySieve" \
       org.opencontainers.image.description="Derive Kubernetes network policy from a GitOps repository's own manifests." \
