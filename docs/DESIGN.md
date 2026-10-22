@@ -53,6 +53,64 @@ If a second GitOps repo ever needs this, the Discovery layer is the promotable k
 could live in StageFreight, which already renders the repo for gitops validation); Render
 stays a per-project concern. We do **not** pre-build that generality — one consumer today.
 
+## Honesty gate — never emit a policy smaller than reality
+
+Repo-driven derivation has a bounded blind spot: Helm-rendered and operator-rendered pods do
+not exist in `kustomize build` output. A policy derived from what the repo cannot see would
+silently drop ports that real traffic uses. The core rule: **under partial coverage, preserve;
+never prune against what cannot be verified.**
+
+Discovery carries two coverage signals:
+
+- **Workload visibility** — `ServiceHasVisibleWorkload`: does any repo workload's pod template
+  satisfy the Service's selector? A backend with no visible workload is **blind**: its
+  non-routed ports (e.g. health-check ports) are unknown.
+- **Port resolution** — each backend carries a resolved-vs-fallback bit. A Service absent from
+  the repo, or a named `targetPort` that resolves neither through an `EndpointSlice` nor through
+  the backing workload's named container port, yields a guessed port. Such a backend is
+  **route-blind**. Named ports on raw (non-Helm) workloads resolve from the pod template, so
+  they need no runtime `EndpointSlice`.
+
+When any backend a policy file depends on is blind or route-blind, the profile folds the
+**committed** file's existing ports into its output — additive only — and does not contribute
+the guessed port. Every run **reports** the blind and route-blind backends by name on stderr.
+When nothing is blind, the derived set is authoritative and pruning stale ports is safe.
+
+Because `kustomize build` is the only reader, apps not referenced by an active kustomization
+are invisible by construction and need no special-casing.
+
+## Source layering — repo, then live cluster, then Helm render
+
+The repo is always read. Two optional, best-effort layers can resolve blind backends:
+
+```
+repo (always) ──▶ --cluster (live state) ──▶ --helm (rendered charts) ──▶ Discovery
+```
+
+- **`--cluster`** (`--kubectl` selects the binary) runs `kubectl get` for Deployments,
+  StatefulSets, DaemonSets, Services and EndpointSlices across all namespaces. HTTPRoutes are
+  deliberately **not** fetched: routing intent stays repo-authoritative; the cluster only
+  resolves ports and the pods behind them.
+- **`--helm`** (`--helm-bin` selects the binary) resolves each Flux `HelmRelease`'s chart from
+  its pinned source (`HelmRepository` classic or OCI, or an `OCIRepository` via
+  `chartRef`/`sourceRef`), runs `helm template` with the inline `spec.values`, and feeds the
+  rendered workloads into discovery. `valuesFrom` is ignored. `GitRepository` chart sources
+  are unsupported. This tier reaches a chart registry, so it trades hermeticity for coverage.
+
+Precedence is by append order under discovery's first-occurrence-wins indexing: repo objects
+are parsed first, then cluster objects, then rendered charts. Repo objects always win; live
+state wins over a render; later layers only fill gaps.
+
+Each layer degrades safely. An unreachable cluster is a warning and the run falls back to the
+repo alone. A HelmRelease that will not render is skipped and reported per release, never a
+hard error. Whatever stays unresolved remains blind, and the honesty gate preserves it. Absence
+of a layer can make output less precise; it never makes it smaller than reality.
+
+Operator-managed workloads that are not charts stay blind in every layer except `--cluster`,
+and are preserved and reported when it is off.
+
+The container image bundles `kustomize`, `kubectl` and `helm` so all three layers run from it.
+
 ## MVP — reproduce the dungeon generators, byte-for-byte
 
 Scope of v0: replace `dungeon/hack/gen-cilium-backend-ports.sh` and
