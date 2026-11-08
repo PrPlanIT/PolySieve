@@ -1,7 +1,7 @@
 // Package discovery is the generic, cluster-agnostic half of PolySieve: it turns a set of
 // rendered Kubernetes objects into a RouteGraph — the resolved (gateway, backend-namespace,
 // backend-port) tuples a policy can be derived from. It has no knowledge of any particular
-// cluster's label model, CRDs, or gateway identities; that lives in a profile.
+// cluster's label model, CRDs, or gateway identities; that lives in the policy emitters.
 package discovery
 
 import (
@@ -15,7 +15,7 @@ import (
 // namespace, and that Service's declared port resolves to a concrete backend (pod) port.
 type Backend struct {
 	RouteNS     string // namespace of the HTTPRoute
-	Gateway     string // parentRef name, verbatim (e.g. "xylem-gateway")
+	Gateway     string // parentRef name, verbatim (e.g. "public-gateway")
 	BackendNS   string // backendRef.namespace, or RouteNS when absent
 	Service     string // backendRef.name
 	ServicePort int    // backendRef.port (the Service port)
@@ -28,7 +28,7 @@ type Backend struct {
 }
 
 // RouteGraph is the discovered ingress graph plus the object index used to resolve ports.
-// Profiles read Backends for policy derivation and use the index for auxiliary lookups
+// The policy emitters read Backends for policy derivation and use the index for auxiliary lookups
 // (e.g. annotation- or label-driven probe ports).
 type RouteGraph struct {
 	Backends []Backend
@@ -87,38 +87,86 @@ func Build(objs *kube.Objects) *RouteGraph {
 	return g
 }
 
-// IngressGateway is a discovered Gateway that participates in a profile's ingress contract.
-// Its identity is read straight from the manifest — no gateway names or namespaces are baked
-// into PolySieve — so the same engine derives policy for any cluster whose ingress gateways
-// wear the contract labels.
+// IngressGateway is a discovered Gateway that participates in the ingress contract. Its
+// identity is read straight from the manifest.
 type IngressGateway struct {
-	Name      string // Gateway resource name (matches a route's parentRef name)
-	Namespace string // where the Gateway — and thus its data-plane ServiceAccount — lives
-	Class     string // short instance name used to group/label the derived policy
+	Name           string // Gateway resource name (matches a route's parentRef name)
+	Namespace      string // where the Gateway — and thus its data-plane ServiceAccount — lives
+	Class          string // short instance name used to group/label the derived policy
+	ServiceAccount string // data-plane ServiceAccount: "<name>-<gatewayClassName>" (Istio's naming)
 }
 
-// IngressGateways returns the Gateways whose infrastructure labels mark them as ingress
-// gateways under the caller's contract, keyed by Gateway name. A Gateway qualifies when it
-// carries classLabelKey=classLabelVal; its Class is read from instanceLabelKey, falling back
-// to the Gateway name with a trailing "-gateway" removed. This is a generic mechanism: the
-// profile supplies the label keys, keeping every cluster-specific value out of the engine.
-func (g *RouteGraph) IngressGateways(classLabelKey, classLabelVal, instanceLabelKey string) map[string]IngressGateway {
+// GatewaySelection says which Gateways are ingress gateways and how each one is named.
+type GatewaySelection struct {
+	// Selector matches Gateway infrastructure labels. Empty selects every Istio-managed Gateway.
+	Selector map[string]string
+	// InstanceLabel is the infrastructure label holding the short instance name; absent, the
+	// Gateway name with a trailing "-gateway" removed.
+	InstanceLabel string
+}
+
+const (
+	istioController   = "istio.io/gateway-controller"
+	istioDefaultClass = "istio" // the GatewayClass istiod creates at runtime
+)
+
+// IngressGateways returns the Gateways the selection marks as ingress gateways, keyed by
+// Gateway name.
+func (g *RouteGraph) IngressGateways(sel GatewaySelection) map[string]IngressGateway {
+	controllers := map[string]string{}
+	for _, c := range g.Objects.GatewayClasses {
+		controllers[c.Metadata.Name] = c.Spec.ControllerName
+	}
 	out := map[string]IngressGateway{}
 	for _, gw := range g.Objects.Gateways {
 		labels := gw.Spec.Infrastructure.Labels
-		if labels[classLabelKey] != classLabelVal {
+		className := gw.Spec.GatewayClassName
+		if len(sel.Selector) > 0 {
+			if !labelsSatisfy(labels, sel.Selector) {
+				continue
+			}
+		} else if !isIstioClass(controllers, className) {
 			continue
 		}
-		class := labels[instanceLabelKey]
+		class := ""
+		if sel.InstanceLabel != "" {
+			class = labels[sel.InstanceLabel]
+		}
 		if class == "" {
 			class = strings.TrimSuffix(gw.Metadata.Name, "-gateway")
 		}
 		out[gw.Metadata.Name] = IngressGateway{
-			Name:      gw.Metadata.Name,
-			Namespace: gw.Metadata.Namespace,
-			Class:     class,
+			Name:           gw.Metadata.Name,
+			Namespace:      gw.Metadata.Namespace,
+			Class:          class,
+			ServiceAccount: gw.Metadata.Name + "-" + className,
 		}
 	}
+	return out
+}
+
+// isIstioClass reports whether a GatewayClass is Istio's: by its controllerName when the class
+// is in the object set, else by Istio's runtime-created class name.
+func isIstioClass(controllers map[string]string, className string) bool {
+	if ctrl, ok := controllers[className]; ok {
+		return ctrl == istioController
+	}
+	return className == istioDefaultClass
+}
+
+// WorkloadNamespaces returns the sorted, unique namespaces of workloads whose pod template
+// satisfies selector.
+func (g *RouteGraph) WorkloadNamespaces(selector map[string]string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, w := range g.Objects.Workloads {
+		if !labelsSatisfy(w.Spec.Template.Metadata.Labels, selector) || seen[w.Metadata.Namespace] {
+			continue
+		}
+		seen[w.Metadata.Namespace] = true
+		out = append(out, w.Metadata.Namespace)
+	}
+	sort.Strings(out)
 	return out
 }
 
@@ -198,7 +246,7 @@ func (g *RouteGraph) workloadNamedPort(ns string, selector map[string]string, na
 }
 
 // WorkloadsWithPodLabel returns the container ports (TCP or unset protocol) of every
-// workload whose pod template carries label==value. Used by profiles for label-driven
+// workload whose pod template carries label==value. Used for label-driven
 // probe-port derivation; generic mechanism, no cluster-specific meaning here.
 func (g *RouteGraph) WorkloadsWithPodLabel(label, value string) []int {
 	var ports []int
@@ -258,7 +306,7 @@ func labelsSatisfy(have, want map[string]string) bool {
 }
 
 // ServicesWithAnnotation returns services carrying any of the given annotation keys with a
-// non-empty value. Generic mechanism used by profiles (e.g. gatus endpoint annotations).
+// non-empty value. Generic mechanism (e.g. health-prober opt-in annotations).
 func (g *RouteGraph) ServicesWithAnnotation(keys ...string) []kube.Service {
 	var out []kube.Service
 	for _, s := range g.Objects.Services {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 
@@ -27,7 +28,48 @@ func RenderRoots(ctx context.Context, kustomizeBin, repoDir string, roots []stri
 	return objs, nil
 }
 
+// kustomizeBuild renders dir. A directory without a kustomization file is rendered as Flux does:
+// its YAML files and subdirectories, recursively, a subdirectory with a kustomization file built.
 func kustomizeBuild(ctx context.Context, bin, dir string) ([]byte, error) {
+	if hasKustomization(dir) {
+		return kustomizeRun(ctx, bin, dir)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	for _, e := range entries {
+		p := filepath.Join(dir, e.Name())
+		var b []byte
+		switch {
+		case e.IsDir():
+			b, err = kustomizeBuild(ctx, bin, p)
+		case filepath.Ext(p) == ".yaml" || filepath.Ext(p) == ".yml":
+			b, err = os.ReadFile(p)
+		default:
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		out.WriteString("---\n")
+		out.Write(b)
+		out.WriteString("\n")
+	}
+	return out.Bytes(), nil
+}
+
+func hasKustomization(dir string) bool {
+	for _, n := range []string{"kustomization.yaml", "kustomization.yml", "Kustomization"} {
+		if _, err := os.Stat(filepath.Join(dir, n)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func kustomizeRun(ctx context.Context, bin, dir string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, bin, "build", dir, "--load-restrictor=LoadRestrictionsNone")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

@@ -38,7 +38,7 @@ func TestChartLocation(t *testing.T) {
 	}
 
 	// Classic HelmRepository → chart name + --repo url + --version.
-	hr := mkHR("gossip-stone")
+	hr := mkHR("monitoring")
 	hr.Spec.Chart.Spec.Chart = "grafana"
 	hr.Spec.Chart.Spec.Version = "8.5.1"
 	hr.Spec.Chart.Spec.SourceRef = kube.SourceRef{Kind: "HelmRepository", Name: "grafana", Namespace: "flux-system"}
@@ -48,7 +48,7 @@ func TestChartLocation(t *testing.T) {
 	}
 
 	// OCI-typed HelmRepository → url/chart + --version.
-	hr = mkHR("hyrule-castle")
+	hr = mkHR("registry")
 	hr.Spec.Chart.Spec.Chart = "harbor"
 	hr.Spec.Chart.Spec.Version = "1.15.0"
 	hr.Spec.Chart.Spec.SourceRef = kube.SourceRef{Kind: "HelmRepository", Name: "harbor", Namespace: "flux-system"}
@@ -58,7 +58,7 @@ func TestChartLocation(t *testing.T) {
 	}
 
 	// chartRef → OCIRepository, tag wins as the version.
-	hr = mkHR("tingle-tuner")
+	hr = mkHR("apps")
 	hr.Spec.ChartRef = kube.SourceRef{Kind: "OCIRepository", Name: "podinfo", Namespace: "flux-system"}
 	got, err = chartLocation(hr, helmRepos, ociRepos)
 	if err != nil || strings.Join(got, " ") != "oci://ghcr.io/stefanprodan/charts/podinfo --version 6.7.0" {

@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -65,16 +66,34 @@ type ParentRef struct {
 }
 
 // ── Gateway ────────────────────────────────────────────────────────────────────
-// The minimal Gateway API Gateway: PolySieve reads its identity (name/namespace) and the
-// infrastructure labels a profile uses to recognise it (e.g. an ingress-contract marker and
-// a short instance name). The gateway's namespace is where its data-plane ServiceAccount lives.
+// The minimal Gateway API Gateway: its identity (name/namespace), its class, and the
+// infrastructure labels used to recognise it. The gateway's namespace is where its data-plane
+// ServiceAccount lives.
 
 type Gateway struct {
 	Metadata ObjectMeta `yaml:"metadata"`
 	Spec     struct {
-		Infrastructure struct {
+		GatewayClassName string `yaml:"gatewayClassName"`
+		Infrastructure   struct {
 			Labels map[string]string `yaml:"labels"`
 		} `yaml:"infrastructure"`
+	} `yaml:"spec"`
+}
+
+type GatewayClass struct {
+	Metadata ObjectMeta `yaml:"metadata"`
+	Spec     struct {
+		ControllerName string `yaml:"controllerName"`
+	} `yaml:"spec"`
+}
+
+// ── Flux Kustomization (for build-root discovery) ────────────────────────────
+
+type FluxKustomization struct {
+	Metadata ObjectMeta `yaml:"metadata"`
+	Spec     struct {
+		Path      string    `yaml:"path"`
+		SourceRef SourceRef `yaml:"sourceRef"`
 	} `yaml:"spec"`
 }
 
@@ -191,14 +210,16 @@ type OCIRepository struct {
 
 // Objects is everything PolySieve extracted from a rendered manifest stream.
 type Objects struct {
-	HTTPRoutes       []HTTPRoute
-	Gateways         []Gateway
-	Services         []Service
-	EndpointSlices   []EndpointSlice
-	Workloads        []Workload
-	HelmReleases     []HelmRelease
-	HelmRepositories []HelmRepository
-	OCIRepositories  []OCIRepository
+	HTTPRoutes         []HTTPRoute
+	Gateways           []Gateway
+	GatewayClasses     []GatewayClass
+	FluxKustomizations []FluxKustomization
+	Services           []Service
+	EndpointSlices     []EndpointSlice
+	Workloads          []Workload
+	HelmReleases       []HelmRelease
+	HelmRepositories   []HelmRepository
+	OCIRepositories    []OCIRepository
 }
 
 // typeMeta is used to route each YAML document to its decoder.
@@ -249,6 +270,21 @@ func dispatch(dst *Objects, node *yaml.Node) error {
 			return fmt.Errorf("decoding Gateway: %w", err)
 		}
 		dst.Gateways = append(dst.Gateways, o)
+	case "GatewayClass":
+		var o GatewayClass
+		if err := node.Decode(&o); err != nil {
+			return fmt.Errorf("decoding GatewayClass: %w", err)
+		}
+		dst.GatewayClasses = append(dst.GatewayClasses, o)
+	case "Kustomization":
+		if !strings.HasPrefix(tm.APIVersion, "kustomize.toolkit.fluxcd.io/") {
+			return nil
+		}
+		var o FluxKustomization
+		if err := node.Decode(&o); err != nil {
+			return fmt.Errorf("decoding Flux Kustomization: %w", err)
+		}
+		dst.FluxKustomizations = append(dst.FluxKustomizations, o)
 	case "Service":
 		var o Service
 		if err := node.Decode(&o); err != nil {

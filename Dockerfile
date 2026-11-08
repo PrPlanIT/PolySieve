@@ -25,7 +25,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
       -o /out/polysieve ./cmd/polysieve
 
 # kustomize — built from source through the module proxy (same toolchain, no GitHub-release
-# egress). Pinned to the version the dungeon host renders with, so output stays byte-exact.
+# egress). Pinned so rendered output is reproducible.
 ARG KUSTOMIZE_VERSION=v5.8.0
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \

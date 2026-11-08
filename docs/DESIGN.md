@@ -33,8 +33,8 @@ policy when apps change" guard coherent — the source *is* the apps.
 ## Architecture — two layers, one seam
 
 ```
-repo ──▶ Discovery ──▶ RouteGraph ──▶ Render(profile) ──▶ policy files
-        (generic)      (typed artifact)  (project-specific)
+repo ──▶ Discovery ──▶ RouteGraph ──▶ Render(emitters) ──▶ policy files
+        (generic)      (typed artifact)  (configured shape)
 ```
 
 - **Discovery (generic).** `kustomize build` the overlays, walk the Gateway API graph:
@@ -43,15 +43,30 @@ repo ──▶ Discovery ──▶ RouteGraph ──▶ Render(profile) ──�
   gateway each route's `parentRefs` targets. Output is a typed **RouteGraph** — no policy
   shape, no cluster labels. This layer is reusable across any Gateway-API GitOps repo.
 
-- **Render (project-specific, profile-driven).** A **profile** maps the RouteGraph to a
-  cluster's concrete policy: which CRDs to emit, the label/identity model (e.g. the dungeon's
-  `policy.prplanit.com/*` Universal Capability Model), the gateway → SA-principal mapping,
-  and the on-disk file layout. The dungeon cluster is **profile #1**.
+- **Render (emitters).** Each emitter maps the RouteGraph to one policy shape: the Cilium
+  ingress-backend contract, the Cilium health-prober allowance, and the per-namespace Istio
+  gateway-ingress `AuthorizationPolicy` set. Nothing environment-specific is compiled in.
 
-The seam is deliberate: the same discipline as separating *discovery* from *presentation*.
-If a second GitOps repo ever needs this, the Discovery layer is the promotable kernel (it
-could live in StageFreight, which already renders the repo for gitops validation); Render
-stays a per-project concern. We do **not** pre-build that generality — one consumer today.
+## Derive first, configure only to override
+
+Every input is derived from the repo or follows an upstream convention; a config file or flags
+override it.
+
+- **Build roots** — the paths of the Flux `Kustomization`s reachable from the repo's
+  self-syncing one (the `flux bootstrap` sync), through Kustomizations of the same source. A
+  path without a kustomization file is rendered as Flux renders it.
+- **Ingress gateways** — Istio-managed Gateways (GatewayClass controller
+  `istio.io/gateway-controller`, or Istio's runtime `istio` class); a label selector instead
+  when the repo marks its own. The data-plane ServiceAccount is `<gateway>-<gatewayClassName>`,
+  Istio's naming.
+- **Contract source** — each gateway's pods by Istio's `gateway.networking.k8s.io/gateway-name`
+  label, or a configured pod selector per gateway namespace.
+- **Health prober** — the workloads matching the prober selector (default
+  `app.kubernetes.io/name: gatus`); the policy's source namespace is wherever they run. No match
+  is an error, never a guess.
+- **Pod labels** — PolySieve's own `polysieve.prplanit.com/ingress` and `/probe`, or the repo's.
+- **Output locations** — where the repo already holds a generated file of that kind and name
+  (files starting `# DERIVED:`), else `policies/`.
 
 ## Honesty gate — never emit a policy smaller than reality
 
@@ -71,7 +86,7 @@ Discovery carries two coverage signals:
   **route-blind**. Named ports on raw (non-Helm) workloads resolve from the pod template, so
   they need no runtime `EndpointSlice`.
 
-When any backend a policy file depends on is blind or route-blind, the profile folds the
+When any backend a policy file depends on is blind or route-blind, the emitter folds the
 **committed** file's existing ports into its output — additive only — and does not contribute
 the guessed port. Every run **reports** the blind and route-blind backends by name on stderr.
 When nothing is blind, the derived set is authoritative and pruning stale ports is safe.
@@ -111,24 +126,9 @@ and are preserved and reported when it is off.
 
 The container image bundles `kustomize`, `kubectl` and `helm` so all three layers run from it.
 
-## MVP — reproduce the dungeon generators, byte-for-byte
-
-Scope of v0: replace `dungeon/hack/gen-cilium-backend-ports.sh` and
-`gen-gateway-ingress-policies.sh`.
-
-1. **Discovery** over the dungeon `fluxcd/` overlays → RouteGraph.
-2. **Profile: dungeon** → emit:
-   - the Cilium `ccnp-contract-ingress-backend.yaml` backend-port contract, and
-   - the per-namespace `allow-gateway-ingress-<gateway>.yaml` Istio `AuthorizationPolicy` set.
-3. **Acceptance gate:** golden diff — PolySieve's output must be **byte-identical** to the
-   files currently committed in the dungeon for the current app set. This proves two things
-   at once: the tool is correct, *and* the profile/config model is expressive enough to be
-   real (if the dungeon's shape can't be expressed cleanly as a profile, that's the signal
-   the generalization was premature).
-
 ## Non-goals (for now)
 
-Multi-cluster profile library; additional CRD backends (plain `NetworkPolicy`, Gateway-API
+Additional CRD backends (plain `NetworkPolicy`, Gateway-API
 `*Policy`); egress derivation; live-cluster reconciliation/diffing. All additive once the
 byte-identical MVP lands.
 

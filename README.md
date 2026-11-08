@@ -17,8 +17,7 @@ the *source of truth* — rather than from a live cluster.
 
 Given a repo of Gateway API `HTTPRoute`s and `Service`s, PolySieve resolves the least-privilege
 ingress each namespace actually needs and emits the corresponding policy objects (Cilium
-`CiliumClusterwideNetworkPolicy`, Istio `AuthorizationPolicy`, …) in the shape a given cluster
-expects, selected by a **profile**.
+`CiliumClusterwideNetworkPolicy`, Istio `AuthorizationPolicy`, …).
 
 A **sieve** is a filter that decides what passes; a network policy is a sieve over traffic
 (the allow-list is what gets through). "Poly" ⇒ *policy* and *poly-backend*.
@@ -34,18 +33,56 @@ and its policy land in **one commit, no gap**.
 ## Usage
 
 ```
-polysieve generate --repo <gitops-repo> --profile dungeon   # write derived policy files
-polysieve check    --repo <gitops-repo> --profile dungeon   # diff vs committed (nonzero on drift)
+polysieve generate --repo <gitops-repo>   # write derived policy files
+polysieve check    --repo <gitops-repo>   # diff vs committed (nonzero on drift)
 ```
 
-`--root` overrides the profile's kustomize build directories; `--kustomize` sets the binary.
+Everything is derived from the repo by default:
+
+| Setting | Default | Flag |
+|---|---|---|
+| Build roots | Paths of the Flux Kustomizations reachable from the repo's self-syncing one | `--root` |
+| Ingress gateways | Istio-managed Gateways | `--gateway-selector`, `--gateway-instance-label` |
+| Contract source pods | Each gateway's pods, by `gateway.networking.k8s.io/gateway-name` | `--gateway-pod-selector` |
+| Gateway ServiceAccount | `<gateway>-<gatewayClassName>` (Istio's naming) | — |
+| Health prober | Workloads labelled `app.kubernetes.io/name: gatus`, in whatever namespace they run | `--prober-selector` |
+| Backend / probe pod labels | `polysieve.prplanit.com/ingress`, `polysieve.prplanit.com/probe` | `--ingress-label`, `--probe-label` |
+| Output locations | Where the repo already holds the generated policy, else `policies/` | `--contract-path`, `--healthcheck-path`, `--gateway-ingress-dir` |
+| Outputs | contract, healthcheck, gateway-ingress | `--disable` |
+
+Settings can also come from a file: `--config <path>`, or `.polysieve.yml` at the repo root when
+present. Flags override the file.
+
+```yaml
+roots: []
+labels:
+  ingress: example.com/ingress
+  probe: example.com/probe
+gateways:
+  selector: { example.com/client-class: ingress-gateway }
+  instanceLabel: example.com/ingress-instance
+  podSelector: { example.com/client-class: ingress-gateway }
+outputs:
+  contract:       { enabled: true, name: contract-ingress-backend, path: "" }
+  healthcheck:
+    enabled: true
+    name: allow-gatus-healthcheck
+    path: ""
+    prober: { matchLabels: { app.kubernetes.io/name: gatus } }
+    serviceAnnotations:
+      enabled: gatus.home-operations.com/enabled
+      endpoint: gatus.home-operations.com/endpoint
+  gatewayIngress: { enabled: true, name: allow-gateway-ingress, dir: "" }
+```
+
+`--kustomize`, `--kubectl` and `--helm-bin` set the binaries.
 
 ## Architecture
 
-`repo → Discovery (generic route-graph) → Render (profile) → policy files`
+`repo → Discovery (generic route-graph) → Render (policy emitters) → policy files`
 
 Discovery renders the repo and walks the Gateway API graph
-(`HTTPRoute.backendRefs → Service → targetPort`) into a typed `RouteGraph`. A profile maps that
+(`HTTPRoute.backendRefs → Service → targetPort`) into a typed `RouteGraph`. The emitters map that
 graph to a cluster's concrete policy. See [docs/DESIGN.md](docs/DESIGN.md).
 
 ## License

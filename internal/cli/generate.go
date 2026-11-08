@@ -9,11 +9,14 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/PrPlanIT/PolySieve/internal/cluster"
+	"github.com/PrPlanIT/PolySieve/internal/config"
 	"github.com/PrPlanIT/PolySieve/internal/discovery"
 	"github.com/PrPlanIT/PolySieve/internal/helm"
-	"github.com/PrPlanIT/PolySieve/internal/profile"
-	"github.com/PrPlanIT/PolySieve/internal/profile/dungeon"
+	"github.com/PrPlanIT/PolySieve/internal/policy"
 )
+
+// over holds the settings given as flags; they override the config file.
+var over config.Config
 
 var generateCmd = &cobra.Command{
 	Use:   "generate",
@@ -33,13 +36,18 @@ func init() {
 }
 
 func run(cmd *cobra.Command, write bool) error {
-	prof, err := selectProfile(flagProfile)
+	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
-	roots := flagRoots
+	roots := cfg.Roots
 	if len(roots) == 0 {
-		roots = prof.Roots()
+		if roots, err = discovery.FluxRoots(cmd.Context(), flagKustomize, flagRepo); err != nil {
+			return err
+		}
+	}
+	if err := policy.Locate(flagRepo, &cfg); err != nil {
+		return err
 	}
 
 	objs, err := discovery.RenderRoots(cmd.Context(), flagKustomize, flagRepo, roots)
@@ -70,7 +78,7 @@ func run(cmd *cobra.Command, write bool) error {
 	committed := func(path string) ([]byte, error) {
 		return os.ReadFile(filepath.Join(flagRepo, path))
 	}
-	files, report, err := prof.Render(discovery.Build(objs), committed)
+	files, report, err := policy.Render(cfg, discovery.Build(objs), committed)
 	if err != nil {
 		return err
 	}
@@ -104,13 +112,13 @@ func run(cmd *cobra.Command, write bool) error {
 // reportCoverage surfaces the honesty gate's finding: ingress backends PolySieve could not see
 // in the repo (Helm/operator-rendered). Their ports were preserved, not pruned — the run says
 // so plainly rather than silently emitting a smaller policy.
-func reportCoverage(r profile.Report) {
+func reportCoverage(r policy.Report) {
 	if len(r.BlindServices) == 0 && len(r.RouteBlindServices) == 0 {
 		return
 	}
 	if len(r.BlindServices) > 0 {
 		fmt.Fprintf(os.Stderr, "coverage: %d ingress backend(s) with no visible workload (Helm/operator pods);\n", len(r.BlindServices))
-		fmt.Fprintln(os.Stderr, "their Gatus healthcheck ports were preserved, not pruned:")
+		fmt.Fprintln(os.Stderr, "their health-prober ports were preserved, not pruned:")
 		for _, s := range r.BlindServices {
 			fmt.Fprintln(os.Stderr, "  -", s)
 		}
@@ -125,11 +133,41 @@ func reportCoverage(r profile.Report) {
 	fmt.Fprintln(os.Stderr, "resolve them with cluster/helm augmentation to enable pruning.")
 }
 
-func selectProfile(name string) (profile.Profile, error) {
-	switch name {
-	case "dungeon":
-		return dungeon.New(), nil
-	default:
-		return nil, fmt.Errorf("unknown profile %q (known: dungeon)", name)
+// loadConfig returns the defaults, overlaid with the config file (--config, else
+// <repo>/.polysieve.yml when present), then with the flags.
+func loadConfig() (config.Config, error) {
+	cfg := config.Default()
+	path := flagConfig
+	if path == "" {
+		if p := filepath.Join(flagRepo, ".polysieve.yml"); fileExists(p) {
+			path = p
+		}
 	}
+	if path != "" {
+		file, err := config.Load(path)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.Overlay(file)
+	}
+	cfg.Overlay(over)
+	off := false
+	for _, d := range flagDisable {
+		switch d {
+		case "contract":
+			cfg.Outputs.Contract.Enabled = &off
+		case "healthcheck":
+			cfg.Outputs.Healthcheck.Enabled = &off
+		case "gateway-ingress":
+			cfg.Outputs.GatewayIngress.Enabled = &off
+		default:
+			return cfg, fmt.Errorf("--disable %q: known outputs are contract, healthcheck, gateway-ingress", d)
+		}
+	}
+	return cfg, nil
+}
+
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
 }

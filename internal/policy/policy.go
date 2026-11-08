@@ -1,8 +1,7 @@
-// Package dungeon is PolySieve profile #1 — the PrPlanIT "dungeon" GitOps cluster. It
-// reproduces the output of the repo's two legacy generators (gen-cilium-backend-ports.sh
-// and gen-gateway-ingress-policies.sh) byte-for-byte, from repo manifests instead of the
-// live cluster.
-package dungeon
+// Package policy renders a RouteGraph into policy files: a Cilium ingress-backend contract, a
+// Cilium health-prober allowance, and per-namespace Istio gateway-ingress AuthorizationPolicies.
+// Label keys, gateway selection, names and paths come from the config.
+package policy
 
 import (
 	"fmt"
@@ -11,86 +10,73 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/PrPlanIT/PolySieve/internal/config"
 	"github.com/PrPlanIT/PolySieve/internal/discovery"
-	"github.com/PrPlanIT/PolySieve/internal/profile"
 )
 
-// New returns the dungeon profile.
-func New() profile.Profile { return dungeon{} }
-
-type dungeon struct{}
-
-func (dungeon) Name() string { return "dungeon" }
-
-// Roots are the Flux-reconciled kustomize build directories that carry the dungeon's
-// HTTPRoutes, Services, EndpointSlices and workloads — the repo-driven equivalent of the
-// reference generators' cluster-wide `kubectl get`. Overridable at the CLI with --root.
-func (dungeon) Roots() []string {
-	return []string{
-		"fluxcd/apps/overlays/production",
-		"fluxcd/infrastructure/configs/overlays/production",
-		"fluxcd/infrastructure/services/overlays/production/phase-01-storage",
-		"fluxcd/infrastructure/services/overlays/production/phase-02-critical",
-		"fluxcd/infrastructure/services/overlays/production/phase-03-core",
-		"fluxcd/infrastructure/services/overlays/production/phase-04-platform",
-	}
+// File is one policy file to emit: a repo-relative path and its exact byte content.
+type File struct {
+	Path    string
+	Content []byte
 }
 
-// ── Gateway model ────────────────────────────────────────────────────────────
-// The dungeon's ingress gateways are discovered from the repo, never hardcoded. A Gateway is
-// an ingress gateway when it carries the ingress-contract client-class label; its short class
-// (used to group and name the derived policy) comes from the ingress-instance label, and its
-// Istio data-plane ServiceAccount is "<gateway-name>-istio" in the Gateway's own namespace
-// (the Gateway-API/Istio default). Only these label keys and the SA convention are profile
-// knowledge — every gateway name and namespace is read from the manifests, so this profile
-// derives correct policy for any cluster that wears the same ingress contract.
-const (
-	clientClassLabel     = "policy.prplanit.com/client-class"
-	ingressGatewayValue  = "ingress-gateway"
-	ingressInstanceLabel = "policy.prplanit.com/ingress-instance"
-	saNameSuffix         = "-istio"
-)
+// CommittedReader returns the current committed bytes of a repo-relative path (nil, nil when
+// absent). The honesty gate uses it to preserve ports it cannot re-derive under partial
+// coverage, so a port that can't be accounted for is never silently pruned.
+type CommittedReader func(path string) ([]byte, error)
 
-// ingressGateways discovers the ingress gateways this profile derives policy for, keyed by
-// Gateway (== parentRef) name.
-func ingressGateways(g *discovery.RouteGraph) map[string]discovery.IngressGateway {
-	return g.IngressGateways(clientClassLabel, ingressGatewayValue, ingressInstanceLabel)
+// Report carries the coverage facts a run must surface so PolySieve never prunes silently.
+type Report struct {
+	// BlindServices are ingress backends ("ns/service") whose serving workload is not visible
+	// in the repo (Helm- or operator-rendered). Their non-routed ports cannot be derived, so a
+	// policy that depends on them (the health-prober allowance) was emitted in preserve mode.
+	BlindServices []string
+	// RouteBlindServices are ingress backends whose routed port could not be resolved from the
+	// repo — the Service is absent or its targetPort is a named port with no EndpointSlice — so
+	// the port is a fallback guess. The route-derived policies for their files were emitted in
+	// preserve mode rather than pruned against a guess.
+	RouteBlindServices []string
+}
+
+// gatewayNameLabel is the label Istio stamps on a Gateway's data-plane pods.
+const gatewayNameLabel = "gateway.networking.k8s.io/gateway-name"
+
+// Render derives the enabled policy files. Output paths must already be resolved (see Locate).
+func Render(cfg config.Config, g *discovery.RouteGraph, committed CommittedReader) ([]File, Report, error) {
+	gws := g.IngressGateways(discovery.GatewaySelection{
+		Selector:      cfg.Gateways.Selector,
+		InstanceLabel: cfg.Gateways.InstanceLabel,
+	})
+	blind := blindIngressServices(g, gws)
+	routeBlind := routeBlindServices(g, gws)
+
+	var files []File
+	out := cfg.Outputs
+	if config.On(out.Contract.Enabled) {
+		files = append(files, ciliumContract(cfg, g, gws, committed))
+	}
+	if config.On(out.Healthcheck.Enabled) {
+		f, err := ciliumHealthcheck(cfg, g, gws, blind, committed)
+		if err != nil {
+			return nil, Report{}, err
+		}
+		files = append(files, f)
+	}
+	if config.On(out.GatewayIngress.Enabled) {
+		files = append(files, istioGatewayIngress(cfg, g, gws, committed)...)
+	}
+	return files, Report{BlindServices: blind, RouteBlindServices: routeBlind}, nil
 }
 
 // classify returns the short class of a route's parentRef gateway, or "" when it is not a
-// discovered ingress gateway (e.g. neko-gateway) — such gateways are excluded from derivation.
+// discovered ingress gateway — such gateways are excluded from derivation.
 func classify(gws map[string]discovery.IngressGateway, gateway string) string {
 	return gws[gateway].Class
 }
 
-// saPrincipal returns the SPIFFE principal of a discovered gateway's data-plane ServiceAccount.
-func saPrincipal(gw discovery.IngressGateway) (ns, name string) {
-	return gw.Namespace, gw.Name + saNameSuffix
-}
-
-const (
-	ciliumBaseDir = "fluxcd/infrastructure/configs/base/cilium-policies"
-	istioOverlay  = "fluxcd/infrastructure/configs/overlays/production/istio-policies"
-	probeLabel    = "policy.prplanit.com/probe"
-	ingressLabel  = "policy.prplanit.com/ingress"
-	gatusEnabled  = "gatus.home-operations.com/enabled"
-	gatusEndpoint = "gatus.home-operations.com/endpoint"
-)
-
-func (d dungeon) Render(g *discovery.RouteGraph, committed profile.CommittedReader) ([]profile.File, profile.Report, error) {
-	gws := ingressGateways(g)
-	blind := blindIngressServices(g, gws)
-	routeBlind := routeBlindServices(g, gws)
-
-	var files []profile.File
-	files = append(files, d.ciliumContract(g, gws, committed), d.ciliumGatus(g, gws, blind, committed))
-	files = append(files, d.istioGatewayIngress(g, gws, committed)...)
-	return files, profile.Report{BlindServices: blind, RouteBlindServices: routeBlind}, nil
-}
-
 // blindIngressServices lists the ingress backends ("ns/service", sorted, unique) whose serving
 // workload is not visible in the repo — rendered by Helm or an operator. These are the backends
-// whose non-routed (container) ports the repo cannot describe, so the Gatus healthcheck
+// whose non-routed (container) ports the repo cannot describe, so the health-prober allowance
 // preserves rather than prunes while any remain unresolved.
 func blindIngressServices(g *discovery.RouteGraph, gws map[string]discovery.IngressGateway) []string {
 	return uniqueBackendServices(g, gws, func(b discovery.Backend) bool {
@@ -124,11 +110,11 @@ func uniqueBackendServices(g *discovery.RouteGraph, gws map[string]discovery.Ing
 	return out
 }
 
-// ── Cilium: contract-ingress-backend ─────────────────────────────────────────
-// Every resolved backend port reachable through the three ingress gateways, cluster-wide.
+// ── Cilium: ingress-backend contract ─────────────────────────────────────────
+// Every resolved backend port reachable through the ingress gateways, cluster-wide.
 
-func (d dungeon) ciliumContract(g *discovery.RouteGraph, gws map[string]discovery.IngressGateway, committed profile.CommittedReader) profile.File {
-	path := ciliumBaseDir + "/ccnp-contract-ingress-backend.yaml"
+func ciliumContract(cfg config.Config, g *discovery.RouteGraph, gws map[string]discovery.IngressGateway, committed CommittedReader) File {
+	path := cfg.Outputs.Contract.Path
 	var ports []int
 	blind := false
 	for _, b := range g.Backends {
@@ -149,16 +135,32 @@ func (d dungeon) ciliumContract(g *discovery.RouteGraph, gws map[string]discover
 		}
 	}
 	ports = discovery.SortDedupInts(ports)
-	return profile.File{
-		Path:    path,
-		Content: []byte(ciliumContractHeader + ciliumContractSources(gws) + ciliumContractToPorts + ciliumPortBlock(ports)),
+	return File{
+		Path: path,
+		Content: []byte(fmt.Sprintf(ciliumContractHeader, cfg.Outputs.Contract.Name, cfg.Labels.Ingress, cfg.Labels.Ingress) +
+			ciliumContractSources(gws, cfg.Gateways.PodSelector) + ciliumToPorts + ciliumPortBlock(ports)),
 	}
 }
 
-// ciliumContractSources renders the contract's fromEndpoints — one matchLabels block per
-// discovered ingress-gateway namespace (deduped, sorted for deterministic output). Each block
-// selects that namespace's ingress-gateway pods; the namespaces come from the manifests.
-func ciliumContractSources(gws map[string]discovery.IngressGateway) string {
+// ciliumContractSources renders the contract's fromEndpoints. With a pod selector: one block per
+// discovered gateway namespace selecting those labels. Without: one block per gateway selecting
+// its pods by gateway name. Sorted for deterministic output.
+func ciliumContractSources(gws map[string]discovery.IngressGateway, podSelector map[string]string) string {
+	var b strings.Builder
+	if len(podSelector) == 0 {
+		list := make([]discovery.IngressGateway, 0, len(gws))
+		for _, gw := range gws {
+			list = append(list, gw)
+		}
+		sort.Slice(list, func(i, j int) bool {
+			return list[i].Namespace+"/"+list[i].Name < list[j].Namespace+"/"+list[j].Name
+		})
+		for _, gw := range list {
+			fmt.Fprintf(&b, "        # %s\n", gw.Name)
+			writeMatchLabels(&b, gw.Namespace, map[string]string{gatewayNameLabel: gw.Name})
+		}
+		return b.String()
+	}
 	byNS := map[string][]string{}
 	for _, gw := range gws {
 		byNS[gw.Namespace] = append(byNS[gw.Namespace], gw.Name)
@@ -168,43 +170,59 @@ func ciliumContractSources(gws map[string]discovery.IngressGateway) string {
 		nss = append(nss, ns)
 	}
 	sort.Strings(nss)
-	var b strings.Builder
 	for _, ns := range nss {
 		names := byNS[ns]
 		sort.Strings(names)
 		fmt.Fprintf(&b, "        # %s\n", strings.Join(names, ", "))
-		b.WriteString("        - matchLabels:\n")
-		fmt.Fprintf(&b, "            k8s:io.kubernetes.pod.namespace: %s\n", ns)
-		fmt.Fprintf(&b, "            %s: %s\n", clientClassLabel, ingressGatewayValue)
+		writeMatchLabels(&b, ns, podSelector)
 	}
 	return b.String()
 }
 
-// ── Cilium: allow-gatus-healthcheck ──────────────────────────────────────────
-// Ports Gatus probes: annotated-service targetPorts + probe-labelled workload containerPorts.
+// writeMatchLabels renders one fromEndpoints matchLabels block: the namespace, then the labels
+// sorted by key.
+func writeMatchLabels(b *strings.Builder, ns string, labels map[string]string) {
+	b.WriteString("        - matchLabels:\n")
+	fmt.Fprintf(b, "            k8s:io.kubernetes.pod.namespace: %s\n", ns)
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(b, "            %s: %s\n", k, labels[k])
+	}
+}
 
-func (d dungeon) ciliumGatus(g *discovery.RouteGraph, gws map[string]discovery.IngressGateway, blind []string, committed profile.CommittedReader) profile.File {
-	path := ciliumBaseDir + "/ccnp-allow-gatus-healthcheck.yaml"
+// ── Cilium: health-prober allowance ──────────────────────────────────────────
+// Ports the prober reaches: annotated-service targetPorts + probe-labelled workload containerPorts.
+
+func ciliumHealthcheck(cfg config.Config, g *discovery.RouteGraph, gws map[string]discovery.IngressGateway, blind []string, committed CommittedReader) (File, error) {
+	hc := cfg.Outputs.Healthcheck
+	path := hc.Path
+
+	prober := hc.Prober.MatchLabels
+	proberNS := g.WorkloadNamespaces(prober)
+	if len(prober) == 0 || len(proberNS) == 0 {
+		return File{}, fmt.Errorf("healthcheck: no workload matches prober selector %v; set it, or disable the healthcheck output", prober)
+	}
 
 	var ports []int
-	// (a) Ports of Gatus-annotated services, resolved to their pod targetPorts.
+	// (a) Ports of annotated services, resolved to their pod targetPorts.
 	for _, s := range g.Objects.Services {
 		ann := s.Metadata.Annotations
-		_, hasEndpoint := ann[gatusEndpoint]
-		if ann[gatusEnabled] != "true" && !hasEndpoint {
+		_, hasEndpoint := ann[hc.ServiceAnnotations.Endpoint]
+		if ann[hc.ServiceAnnotations.Enabled] != "true" && !hasEndpoint {
 			continue
 		}
 		for _, sp := range s.Spec.Ports {
 			ports = append(ports, g.ResolvePort(s.Metadata.Namespace, s.Metadata.Name, sp.Port))
 		}
 	}
-	// (b) Container ports of probe-labelled workloads. The label is rarely set by hand: the
-	// cluster's Kyverno ClusterPolicy `mutate-probe-on-ingress` stamps probe=true onto any
-	// Deployment/StatefulSet/DaemonSet whose pod template carries ingress=true, at admission.
-	// Reading the repo we never see that mutation, so reproduce it by unioning the
-	// ingress-labelled workloads with the few that carry probe=true statically.
-	ports = append(ports, g.WorkloadsWithPodLabel(probeLabel, "true")...)
-	ports = append(ports, g.WorkloadsWithPodLabel(ingressLabel, "true")...)
+	// (b) Container ports of probe-labelled workloads, plus ingress-labelled ones: an admission
+	// policy commonly stamps the probe label onto ingress workloads, which the repo never shows.
+	ports = append(ports, g.WorkloadsWithPodLabel(cfg.Labels.Probe, "true")...)
+	ports = append(ports, g.WorkloadsWithPodLabel(cfg.Labels.Ingress, "true")...)
 	// (c) For ingress backends whose workload is invisible (Helm/operator), we can't read pod
 	// labels or container ports; contribute at least the resolved routed port, since a route
 	// backend behind an ingress gateway is probe-eligible. Non-routed ports are covered by the
@@ -228,7 +246,16 @@ func (d dungeon) ciliumGatus(g *discovery.RouteGraph, gws map[string]discovery.I
 		}
 	}
 	ports = discovery.SortDedupInts(ports)
-	return profile.File{Path: path, Content: []byte(ciliumGatusSkeleton + ciliumPortBlock(ports))}
+
+	var src strings.Builder
+	for _, ns := range proberNS {
+		writeMatchLabels(&src, ns, prober)
+	}
+	return File{
+		Path: path,
+		Content: []byte(fmt.Sprintf(ciliumHealthcheckHeader, hc.Name, cfg.Labels.Probe) +
+			src.String() + ciliumToPorts + ciliumPortBlock(ports)),
+	}, nil
 }
 
 // Port extractors for the two rendered policy formats: the cilium block (`- port: "8200"`)
@@ -263,7 +290,8 @@ func extractPorts(b []byte) []int {
 // One file per (backend namespace, gateway class), allowing that gateway's SA to reach the
 // namespace's ingress-labelled pods on the resolved backend ports.
 
-func (d dungeon) istioGatewayIngress(g *discovery.RouteGraph, gws map[string]discovery.IngressGateway, committed profile.CommittedReader) []profile.File {
+func istioGatewayIngress(cfg config.Config, g *discovery.RouteGraph, gws map[string]discovery.IngressGateway, committed CommittedReader) []File {
+	out := cfg.Outputs.GatewayIngress
 	// class → discovered gateway, for resolving each policy's SA principal from the manifest.
 	byClass := map[string]discovery.IngressGateway{}
 	for _, gw := range gws {
@@ -294,7 +322,6 @@ func (d dungeon) istioGatewayIngress(g *discovery.RouteGraph, gws map[string]dis
 		gr.ports = append(gr.ports, b.Port)
 	}
 
-	// Deterministic file order: sort keys by "ns|class" (matches the reference's key sort).
 	keys := make([]key, 0, len(groups))
 	for k := range groups {
 		keys = append(keys, k)
@@ -303,11 +330,12 @@ func (d dungeon) istioGatewayIngress(g *discovery.RouteGraph, gws map[string]dis
 		return keys[i].ns+"|"+keys[i].class < keys[j].ns+"|"+keys[j].class
 	})
 
-	var files []profile.File
+	var files []File
 	for _, k := range keys {
 		gr := groups[k]
-		saNS, saName := saPrincipal(byClass[k.class])
-		path := fmt.Sprintf("%s/%s/allow-gateway-ingress-%s.yaml", istioOverlay, k.ns, k.class)
+		gw := byClass[k.class]
+		name := out.Name + "-" + k.class
+		path := fmt.Sprintf("%s/%s/%s.yaml", out.Dir, k.ns, name)
 		ports := gr.ports
 		// Honesty gate: if any backend for this namespace routed to a guessed port, preserve the
 		// committed policy's ports rather than prune against the guess.
@@ -316,12 +344,13 @@ func (d dungeon) istioGatewayIngress(g *discovery.RouteGraph, gws map[string]dis
 				ports = append(ports, extractPorts(prev)...)
 			}
 		}
-		files = append(files, profile.File{
+		files = append(files, File{
 			Path: path,
 			Content: []byte(fmt.Sprintf(istioTemplate,
-				k.class,      // metadata.name suffix
-				saNS, saName, // principal ns / name (from the discovered Gateway)
-				istioPortList(discovery.SortDedupInts(ports)), // inline flow list
+				name,
+				cfg.Labels.Ingress,
+				gw.Namespace, gw.ServiceAccount,
+				istioPortList(discovery.SortDedupInts(ports)),
 			)),
 		})
 	}

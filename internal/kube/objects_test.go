@@ -13,7 +13,7 @@ items:
     kind: Service
     metadata:
       name: grafana
-      namespace: gossip-stone
+      namespace: monitoring
     spec:
       selector: { app: grafana }
       ports:
@@ -23,11 +23,11 @@ items:
     kind: Deployment
     metadata:
       name: grafana
-      namespace: gossip-stone
+      namespace: monitoring
     spec:
       template:
         metadata:
-          labels: { app: grafana, policy.prplanit.com/probe: "true" }
+          labels: { app: grafana, example.com/probe: "true" }
         spec:
           containers:
             - ports:
@@ -48,7 +48,7 @@ items:
 		t.Fatalf("workloads = %d, want 1", len(objs.Workloads))
 	}
 	w := objs.Workloads[0]
-	if w.Spec.Template.Metadata.Labels["policy.prplanit.com/probe"] != "true" {
+	if w.Spec.Template.Metadata.Labels["example.com/probe"] != "true" {
 		t.Errorf("probe label not parsed from List item: %+v", w.Spec.Template.Metadata.Labels)
 	}
 	if len(w.Spec.Template.Spec.Containers) != 1 ||
