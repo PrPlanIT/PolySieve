@@ -1,5 +1,5 @@
 # ---- Go build stage ----
-FROM docker.io/library/golang:1.27.3-alpine3.24 AS builder
+FROM docker.io/library/golang:1.27.4-alpine3.24 AS builder
 
 WORKDIR /src
 
