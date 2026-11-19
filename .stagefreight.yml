@@ -58,7 +58,7 @@ metadata:
   description:
     - Generates Kubernetes network and security policies from live cluster state.
     - Reads what a cluster actually does and emits the network/security policies to match, so policy is derived from observed traffic rather than written by hand.
-  license: MIT
+  license: AGPL-3.0-only
   org: PrPlanIT
   title: PolySieve
   topics:
